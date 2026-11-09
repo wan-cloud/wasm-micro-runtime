@@ -9,6 +9,49 @@
 
 [Build WAMR](./doc/build_wamr.md) | [Build AOT Compiler](./wamr-compiler/README.md) | [Embed WAMR](./doc/embed_wamr.md) | [Export Native API](./doc/export_native_api.md) | [Build Wasm Apps](./doc/build_wasm_app.md) | [Samples](./samples/README.md)
 
+## About this fork (branch `xuansi/base-2.4.0`)
+
+This is a downstream fork of `espressif/wasm-micro-runtime` pinned at the
+component-registry release `2.4.0~1` (commit `8f806e0f`, branch
+`esp_based_on_v2.4.0`), carrying a series of small ESP32-S3 patches that
+the consuming project needs. The patch series is kept as eight clean
+commits on top of that pin so it can be rebased, reviewed, cherry-picked
+or upstreamed piecewise. In-code comments mentioning "VENDORED-NOTES.md"
+refer to the patch table below.
+
+### Patch table (relative to espressif/wasm-micro-runtime 2.4.0~1)
+
+| # | Commit | Files | Content |
+|---|--------|-------|---------|
+| 1 | `esp-idf: fix MEM_DUAL_BUS_OFFSET regression` | `core/shared/platform/esp-idf/espidf_memmap.c` | restore the `ada7e3fe` (WAMR #2385) arithmetic: `SOC_IROM_LOW - SOC_DROM_LOW` = +0x6000000; the regressed negative offset landed every heap PSRAM pointer in a dead window and AOT load always failed with `invalid relocation offset` |
+| 2 | `esp-idf: keep WASM_MEM_DUAL_BUS_MIRROR on for S3` | `core/shared/platform/esp-idf/shared_platform.cmake` | the S3 dual-bus define stays on, with a note that the ESP32-classic constant dual-bus alias does not hold for heap PSRAM pages on S3 — patch 3 provides the real mapping |
+| 3 | `esp-idf: S3 os_mmap(EXEC) via real esp_mmu_map` | `core/shared/platform/esp-idf/espidf_memmap.c` | `os_mmap(EXEC)` = page-aligned PSRAM backing + `esp_mmu_map(paddr, PSRAM0, EXEC\|READ, PADDR_SHARED)`; a 16-entry `{exec, dbus, map_size}` table; returns the D-bus pointer, `xuansi_exec_alias()` serves I-window aliases; `os_dcache_flush()` retires to a no-op on S3 (the ROM global I-cache round-dance measurably kills the systimer) |
+| 4 | `aot: hook S3 dual-window exec mapping at the four text write/read sites` | `core/iwasm/aot/aot_loader.c` | PLT init and tail zero-fill write through `os_get_dbus_mirror()`; text copy is followed by `xuansi_sync_exec()` before any I-side read; `func_ptrs` entries switch to the exec alias |
+| 5 | `esp-idf: wamr component REQUIRES esp_mm` | `build-scripts/esp-idf/wamr/CMakeLists.txt` | declare the `esp_mm` dependency introduced by patch 3 |
+| 6 | `esp-idf: line-aligned clamped msync pair` | `core/shared/platform/esp-idf/espidf_memmap.c` | `xuansi_msync_pair()`: rounds `[off, off+len)` outward to cache-line boundaries and clamps to the mapping before the C2M\|DATA writeback (D alias) and M2C\|INST invalidate (I alias); all three sync sites route through it. Root cause: `esp_cache_msync()` silently returned `ESP_ERR_INVALID_ARG` (258) for the loader's 4-byte-aligned ranges, so the load-time sync was a no-op; M2C rejects `FLAG_UNALIGNED`, so the call sites could not be fixed with flags alone (upstreamable candidate, deferred until A0-A3 verified) |
+| 7 | `esp-idf: os_icache_flush must accept the D-side mirror pointer` | `core/shared/platform/esp-idf/espidf_memmap.c` | `xuansi_map_find_by_dbus()`: `aot_load_from_aot_file()` flushes with `module->code`, which is the D-side pointer since patch 3 returns the dbus address — the exec-only lookup missed and the post-relocation sync never ran (upstreamable candidate, deferred until A0-A3 verified) |
+| 8 | `esp-idf: zero-initialize os_mmap allocations` | `core/shared/platform/esp-idf/espidf_memmap.c` | the S3 non-EXEC fast path of `os_mmap()` returned unzeroed `heap_caps_malloc()` memory while both non-S3 branches memset; os_mmap backs WASM linear memory, which the spec requires to start zeroed — a JPEG-encoder module once read a bogus default DHT table from the garbage |
+
+### Known residual
+
+The `esp_mmu_map(EXEC|READ)` window is instruction-fetch-capable, but
+data reads through it are not coherent/safe at runtime on this chip/IDF
+combination; general AOT text that uses literal pools or embedded data
+addresses is still gated off downstream until that is resolved. Patches
+1-2, 6-8 are independent of that issue and stand on their own.
+
+### Upgrade procedure (component upgrade)
+
+1. Re-pin this branch onto the new base (the registry archive's
+   `idf_component.yml` records its `repository_info.commit_sha`).
+2. Check upstream for each patch above (the core ones are #3 exec alias
+   coherence and #1 the constant). If fixed upstream, drop the patch;
+   otherwise replay it — this table plus the commit series is the replay
+   checklist.
+3. Re-verify on target: AOT load/instantiate, native symbol registration,
+   pthread flow, on-board load/call.
+
+
 WebAssembly Micro Runtime (WAMR) is a lightweight standalone WebAssembly (Wasm) runtime with small footprint, high performance and highly configurable features for applications cross from embedded, IoT, edge to Trusted Execution Environment (TEE), smart contract, cloud native and so on. It includes a few parts as below:
 - [**VMcore**](./core/iwasm/): A set of runtime libraries for loading and running Wasm modules. It supports rich running modes including interpreter, Ahead-of-Time compilation(AoT) and Just-in-Time compilation (JIT). WAMR supports two JIT tiers - Fast JIT, LLVM JIT, and dynamic tier-up from Fast JIT to LLVM JIT.
 - [**iwasm**](./product-mini/): The executable binary built with WAMR VMcore which supports WASI and command line interface.
