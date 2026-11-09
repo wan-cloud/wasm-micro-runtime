@@ -395,6 +395,7 @@ static void xuansi_sync_dbus_impl(void *dbus_base, size_t len)
 
 void xuansi_sync_exec(void *ptr, size_t len)
 {
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
     /* 接受 dbus 或 exec 指針（載入器兩種都會傳）。 */
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(ptr);
     if (m != NULL) {
@@ -406,6 +407,15 @@ void xuansi_sync_exec(void *ptr, size_t len)
         return;
     }
     xuansi_sync_dbus_impl(ptr, len);
+#else
+    /* XUANSI (follow-up #10): the symbol is declared outside the S3
+     * guard (aot_loader's DUAL_BUS call site carries no target guard)
+     * but the table and msync machinery exist only for S3 — guard the
+     * body like xuansi_sync_dbus_impl, so non-S3 targets compile and
+     * take the upstream no-sync path. */
+    (void)ptr;
+    (void)len;
+#endif
 }
 
 void
