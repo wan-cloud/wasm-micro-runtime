@@ -9,7 +9,7 @@
 #include "soc/mmu.h"
 #include "rom/cache.h"
 
-#define MEM_DUAL_BUS_OFFSET (SOC_IROM_LOW - SOC_IROM_HIGH)
+#define MEM_DUAL_BUS_OFFSET (SOC_IROM_LOW - SOC_DROM_LOW)
 
 #define in_ibus_ext(addr) \
     (((uint32)addr >= SOC_IROM_LOW) && ((uint32)addr < SOC_IROM_HIGH))
