@@ -175,6 +175,15 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
     }
     uintptr_t *addr_field_8 = buf_fixed_8 - sizeof(uintptr_t);
     *addr_field_8 = (uintptr_t)buf_origin_8;
+    /* XUANSI: zero-initialize the mapping. os_mmap() backs WASM linear
+     * memory, which the spec requires to start zeroed (fresh .bss and
+     * yet-unwritten data pages must read as 0). heap_caps_malloc() does
+     * not zero, and unlike the non-S3 branches below this S3 fast path
+     * never memset, so a fresh instance's linear memory carried heap
+     * garbage (observed as a JPEG-encoder module reading a bogus default
+     * DHT table from unzeroed memory). One memset over the mapped size
+     * at allocation time. */
+    memset(buf_fixed_8, 0, size);
     return buf_fixed_8;
 #else
     if (prot & MMAP_PROT_EXEC) {
