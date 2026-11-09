@@ -14,7 +14,7 @@
 This is a downstream fork of `espressif/wasm-micro-runtime` pinned at the
 component-registry release `2.4.0~1` (commit `8f806e0f`, branch
 `esp_based_on_v2.4.0`), carrying a series of small ESP32-S3 patches that
-the consuming project needs. The patch series is kept as eight clean
+the consuming project needs. The patch series is kept as eleven clean
 commits on top of that pin so it can be rebased, reviewed, cherry-picked
 or upstreamed piecewise. In-code comments mentioning "VENDORED-NOTES.md"
 refer to the patch table below.
@@ -31,6 +31,9 @@ refer to the patch table below.
 | 6 | `esp-idf: line-aligned clamped msync pair` | `core/shared/platform/esp-idf/espidf_memmap.c` | `xuansi_msync_pair()`: rounds `[off, off+len)` outward to cache-line boundaries and clamps to the mapping before the C2M\|DATA writeback (D alias) and M2C\|INST invalidate (I alias); all three sync sites route through it. Root cause: `esp_cache_msync()` silently returned `ESP_ERR_INVALID_ARG` (258) for the loader's 4-byte-aligned ranges, so the load-time sync was a no-op; M2C rejects `FLAG_UNALIGNED`, so the call sites could not be fixed with flags alone (upstreamable candidate, deferred until A0-A3 verified) |
 | 7 | `esp-idf: os_icache_flush must accept the D-side mirror pointer` | `core/shared/platform/esp-idf/espidf_memmap.c` | `xuansi_map_find_by_dbus()`: `aot_load_from_aot_file()` flushes with `module->code`, which is the D-side pointer since patch 3 returns the dbus address — the exec-only lookup missed and the post-relocation sync never ran (upstreamable candidate, deferred until A0-A3 verified) |
 | 8 | `esp-idf: zero-initialize os_mmap allocations` | `core/shared/platform/esp-idf/espidf_memmap.c` | the S3 non-EXEC fast path of `os_mmap()` returned unzeroed `heap_caps_malloc()` memory while both non-S3 branches memset; os_mmap backs WASM linear memory, which the spec requires to start zeroed — a JPEG-encoder module once read a bogus default DHT table from the garbage |
+| 9 | `esp-idf: os_munmap must settle dbus-domain mappings too` | `core/shared/platform/esp-idf/espidf_memmap.c` | `os_mmap(EXEC)` returns the dbus pointer (patch 3) but `os_munmap()` looked up only the exec window, so the dbus pointer never hit: `esp_mmu_unmap()` never ran and the 16-slot table leaked one entry per AOT unload. `xuansi_munmap_exec()` now checks the exec domain first, dbus on miss (mirror of patch 7) and unmaps the recorded mapping base |
+| 10 | `esp-idf: guard xuansi_sync_exec body for non-S3 targets` | `core/shared/platform/esp-idf/espidf_memmap.c` | `xuansi_sync_exec()` lives outside the S3 guard (aot_loader's DUAL_BUS call site has no target guard) but its body referenced S3-guarded types — hard compile error on non-S3. Body now guarded like `xuansi_sync_dbus_impl`; non-S3 takes the upstream no-sync path |
+| 11 | `esp-idf: fail xuansi_mmap_exec honestly when esp_mmu_map fails` | `core/shared/platform/esp-idf/espidf_memmap.c` | the `esp_mmu_map()` return code was ignored: on failure the dead exec window was still tabled and the dbus pointer returned as success (broken alias, burnt slot). Now rc≠`ESP_OK` frees the backing and returns NULL |
 
 ### Known residual
 
