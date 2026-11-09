@@ -106,10 +106,9 @@ static xuansi_exec_map_t *xuansi_map_find_by_dbus(void *ptr)
  * internal heap region carries DRAM caps only - so a
  * heap_caps_malloc(EXEC) placement can never succeed. The A1 placement is
  * a static IRAM reserved region instead:
- *   - one .iram.bss carve-out (NOLOAD, zeroed by the IDF startup), size
- *     tunable via XUANSI_AOT_EXEC_RESERVE_BYTES (compile definition;
- *     24 KB default covers every stock .aot text measured so far, the
- *     largest being st7789 at 20,684 B);
+ *   - one .iram1 carve-out (inside .iram0.text, size tunable via
+ *     XUANSI_AOT_EXEC_RESERVE_BYTES; 24 KB default covers every stock
+ *     .aot text measured so far, the largest being st7789 at 20,684 B);
  *   - single occupancy: one module's text at a time (co-residency waits
  *     for the A3 PSRAM placement), os_mmap(EXEC) refuses when occupied;
  *   - zero-on-alloc (same discipline as patch #8: never hand out stale
@@ -118,6 +117,15 @@ static xuansi_exec_map_t *xuansi_map_find_by_dbus(void *ptr)
  *     and executable through the same address (internal SRAM is
  *     single-alias and uncached on S3, so the loader's data writes and
  *     the I-fetches cohere without any bus translation).
+ * SECTION CHOICE IS LOAD-BEARING (first board attempt): the S3 memory
+ * protection (CONFIG_ESP_SYSTEM_MEMPROT_FEATURE, locked after boot)
+ * splits IRAM at _iram_text_end - .iram0.text and below = R+X, while
+ * .iram0.data/.iram0.bss above the split = R+W with NO execute. A
+ * .iram.bss reserve executes into an int-wdt wedge on the first fetch;
+ * the reserve must live inside the executable span, hence .iram1
+ * (collected into .iram0.text). PROGBITS cost: the reserve occupies the
+ * flash image (~24 KB of zeros copied at boot) - accepted, the app
+ * partition has headroom.
  * Stock .aot never goes to the PSRAM exec path (patch #3 machinery) in
  * A1: the container-gate dispatch lands with the A3 surgery-version
  * modules (T10/T11). */
@@ -126,7 +134,7 @@ static xuansi_exec_map_t *xuansi_map_find_by_dbus(void *ptr)
 #endif
 
 static uint8_t s_xuansi_aot_exec[XUANSI_AOT_EXEC_RESERVE_BYTES]
-    __attribute__((section(".iram.bss"), aligned(16)));
+    __attribute__((section(".iram1"), aligned(16)));
 static uint8_t s_xuansi_aot_exec_used;
 
 /* Single source for the fw-side budget gate and the caps advertisement
