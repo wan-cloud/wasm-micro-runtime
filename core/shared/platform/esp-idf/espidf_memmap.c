@@ -80,6 +80,25 @@ static xuansi_exec_map_t *xuansi_map_find_by_exec(void *ptr)
     return NULL;
 }
 
+/* XUANSI (H1 finding): mirror lookup by the D-bus (data) pointer.
+ * os_mmap(EXEC) returns the D-side heap pointer (patch #3), and
+ * aot_load_from_aot_file() ends with
+ * os_icache_flush(module->code, module->code_size) where module->code is
+ * exactly that D-side pointer - so the post-relocation sync used to miss
+ * the exec-only table lookup and return without syncing at all.
+ * Upstreamable candidate (deferred until A0-A3 verified). */
+static xuansi_exec_map_t *xuansi_map_find_by_dbus(void *ptr)
+{
+    for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
+        uint8_t *b = s_xuansi_maps[i].dbus;
+        if (b != NULL && (uint8_t *)ptr >= b
+            && (uint8_t *)ptr < b + s_xuansi_maps[i].map_size) {
+            return &s_xuansi_maps[i];
+        }
+    }
+    return NULL;
+}
+
 static void *xuansi_mmap_exec(size_t size)
 {
     size_t map_size =
@@ -343,19 +362,13 @@ static void xuansi_sync_dbus_impl(void *dbus_base, size_t len)
 {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     if (dbus_base == NULL || len == 0) return;
-    for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
-        xuansi_exec_map_t *m = &s_xuansi_maps[i];
-        if (m->exec == NULL) continue;
-        if ((uint8_t *)dbus_base >= (uint8_t *)m->dbus
-            && (uint8_t *)dbus_base < (uint8_t *)m->dbus + m->map_size) {
-            uint32_t off =
-                (uint32_t)((uint8_t *)dbus_base - (uint8_t *)m->dbus);
-            uint32_t rest = (uint32_t)m->map_size - off;
-            if (len > rest) len = rest;
-            xuansi_msync_pair(m, off, len);
-            return;
-        }
-    }
+    xuansi_exec_map_t *m = xuansi_map_find_by_dbus(dbus_base);
+    if (m == NULL) return;
+    uint32_t off =
+        (uint32_t)((uint8_t *)dbus_base - (uint8_t *)m->dbus);
+    uint32_t rest = (uint32_t)m->map_size - off;
+    if (len > rest) len = rest;
+    xuansi_msync_pair(m, off, len);
 #endif
 }
 
@@ -386,9 +399,20 @@ os_icache_flush(void *start, size_t len)
      * ——S3 實測殺 systimer（見 os_dcache_flush 注記）。 */
     if (start == NULL || len == 0) return;
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(start);
-    if (m == NULL) return;
     uint8_t *base = (uint8_t *)start;
-    uint32_t off = (uint32_t)(base - (uint8_t *)m->exec);
+    uint32_t off;
+    if (m != NULL) {
+        off = (uint32_t)(base - (uint8_t *)m->exec);
+    }
+    else if ((m = xuansi_map_find_by_dbus(start)) != NULL) {
+        /* XUANSI (H1 finding): the loader passes module->code, which is
+         * the D-side pointer since os_mmap(EXEC) returns the dbus
+         * address (patch #3) - accept it here, not just the exec alias. */
+        off = (uint32_t)(base - (uint8_t *)m->dbus);
+    }
+    else {
+        return;
+    }
     uint32_t rest = (uint32_t)m->map_size - off;
     if (len > rest) len = rest;
     xuansi_msync_pair(m, off, len);
