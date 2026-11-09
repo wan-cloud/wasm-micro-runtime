@@ -360,14 +360,17 @@ void *xuansi_exec_alias(void *dbus_ptr)
 static void
 xuansi_msync_pair(const xuansi_exec_map_t *m, uint32_t off, uint32_t len)
 {
-    int dline = 32, iline = 32;
     uint32_t line, start, end;
 
     if (m == NULL || len == 0)
         return;
-    esp_cache_get_dcache_line_size(&dline);
-    esp_cache_get_icache_line_size(&iline);
-    line = (uint32_t)(dline > iline ? dline : iline);
+    /* XUANSI (first-compile fix): patch #6 assumed
+     * esp_cache_get_{d,i}cache_line_size(&int) helpers that do not
+     * exist in IDF v5.5.5 — the ESP32-S3 ROM accessors (rom/cache.h,
+     * already included) return the line size directly. */
+    uint32_t dline = Cache_Get_DCache_Line_Size();
+    uint32_t iline = Cache_Get_ICache_Line_Size();
+    line = (dline > iline ? dline : iline);
     if (line == 0)
         line = 32;
 
