@@ -119,6 +119,15 @@ static void *xuansi_mmap_exec(size_t size)
     esp_err_t rc = esp_mmu_map(paddr, map_size, MMU_TARGET_PSRAM0,
                                MMU_MEM_CAP_EXEC | MMU_MEM_CAP_READ,
                                ESP_MMU_MMAP_FLAG_PADDR_SHARED, &exec);
+    /* XUANSI (follow-up #11): esp_mmu_map failure must fail honestly —
+     * free the backing and return NULL. The old path entered the table
+     * and returned dbus anyway, reporting success with a dead exec
+     * window (xuansi_exec_alias would hand out an unusable pointer and
+     * the first fetch through it would fault). */
+    if (rc != ESP_OK) {
+        heap_caps_free(dbus);
+        return NULL;
+    }
     for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
         if (s_xuansi_maps[i].exec == NULL) {
             s_xuansi_maps[i].exec = exec;
