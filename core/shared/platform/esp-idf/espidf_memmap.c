@@ -141,18 +141,29 @@ void xuansi_sync_exec(void *exec, size_t len);
 /* dbus→exec 別名（func_ptrs 用——資料面走 D 窗、取指走 I 窗）。 */
 void *xuansi_exec_alias(void *dbus_ptr);
 
-static void xuansi_munmap_exec(void *ptr)
+/* XUANSI (follow-up #9): os_mmap(EXEC) returns the D-bus pointer (patch
+ * #3), but os_munmap() used to consult only the exec-window lookup — the
+ * dbus pointer never hit, so esp_mmu_unmap() was never called and the
+ * 16-slot table leaked one entry per AOT unload (table exhaustion after
+ * 16 load/unload cycles even with PSRAM to spare). Natural companion of
+ * the dbus lookup added in patch #7: exec domain first, dbus domain on
+ * miss, hit = unmap the exec window (needs the mapping base, so pass
+ * m->exec, not the caller's possibly-interior pointer) + free the PSRAM
+ * backing + release the slot. Returns 1 when handled by this mechanism. */
+static int
+xuansi_munmap_exec(void *ptr)
 {
-    for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
-        if (s_xuansi_maps[i].exec == ptr) {
-            esp_mmu_unmap(ptr);
-            heap_caps_free(s_xuansi_maps[i].dbus);
-            s_xuansi_maps[i].exec = NULL;
-            s_xuansi_maps[i].dbus = NULL;
-            s_xuansi_maps[i].map_size = 0;
-            return;
-        }
-    }
+    xuansi_exec_map_t *m = xuansi_map_find_by_exec(ptr);
+    if (m == NULL)
+        m = xuansi_map_find_by_dbus(ptr);
+    if (m == NULL)
+        return 0;
+    esp_mmu_unmap(m->exec);
+    heap_caps_free(m->dbus);
+    m->exec = NULL;
+    m->dbus = NULL;
+    m->map_size = 0;
+    return 1;
 }
 #endif /* CONFIG_IDF_TARGET_ESP32S3 */
 
@@ -257,9 +268,10 @@ os_munmap(void *addr, size_t size)
     char *ptr = (char *)addr;
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-    /* XUANSI：執行映射走表收帳（esp_mmu_unmap＋釋放 PSRAM 背襯）。 */
-    if (xuansi_map_find_by_exec(ptr) != NULL) {
-        xuansi_munmap_exec(ptr);
+    /* XUANSI：執行映射走表收帳（esp_mmu_unmap＋釋放 PSRAM 背襯）。
+     * os_mmap(EXEC) 返回 **dbus** 指針（修補 #3）——收帳查找須涵蓋
+     * dbus 域（追收 #9，見 xuansi_munmap_exec 注記）。 */
+    if (xuansi_munmap_exec(ptr)) {
         return;
     }
 #endif
