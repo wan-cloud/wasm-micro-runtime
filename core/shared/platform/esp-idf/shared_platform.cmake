@@ -15,8 +15,12 @@ set (source_all ${source_all} ${PLATFORM_COMMON_LIBC_UTIL_SOURCE})
 
 set (PLATFORM_SHARED_SOURCE ${source_all} ${PLATFORM_COMMON_MATH_SOURCE})
 
-# If enable PSRAM of ESP32-S3, it had better to put AOT into PSRAM, so that
-# users can use SRAM to for Wi-Fi/BLE and peripheral driver.
+# XUANSI VENDORED PATCH #2 (B10-T2, 2026-11-08, rev 2): the ESP32-classic
+# constant dual-bus alias is broken on S3 (see VENDORED-NOTES.md) — the define
+# stays ON, but espidf_memmap.c now provides the real mapping: esp_mmu_map
+# (EXEC|READ, non-writable per esp_mm caps rules) + a table-backed
+# os_get_dbus_mirror() so every WAMR write goes through the D-bus pointer
+# and every I-fetch through the mapped executable window.
 if(CONFIG_ESP32S3_SPIRAM_SUPPORT)
     add_definitions(-DWASM_MEM_DUAL_BUS_MIRROR=1)
 endif()
