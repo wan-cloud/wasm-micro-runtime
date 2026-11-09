@@ -2758,7 +2758,13 @@ load_text_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
 
     if ((module->code_size > 0) && !module->is_indirect_mode) {
         plt_base = (uint8 *)buf_end - get_plt_table_size();
+        /* XUANSI VENDORED PATCH #4 (B10-T2): ESP32-S3 esp_mmu 執行映射不可
+         * 寫（esp_mm caps 規）——PLT 初始化寫入走 D-bus 鏡像。 */
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0) && defined(CONFIG_IDF_TARGET_ESP32S3)
+        init_plt_table(os_get_dbus_mirror(plt_base));
+#else
         init_plt_table(plt_base);
+#endif
     }
     return true;
 fail:
@@ -2795,6 +2801,15 @@ load_function_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
             return false;
         }
         module->func_ptrs[i] = (uint8 *)module->code + text_offset;
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+        /* XUANSI VENDORED PATCH #5 (B10-T2)：S3 雙視窗方案——載入器資料
+         * 面走 D 窗（cache 同步），取指入口（func_ptrs）換 I 窗執行別名
+         * （esp_mmu_map EXEC|READ 頁；詳 VENDORED-NOTES.md）。 */
+        {
+            extern void *xuansi_exec_alias(void *dbus_ptr);
+            module->func_ptrs[i] = xuansi_exec_alias(module->func_ptrs[i]);
+        }
+#endif
 #if defined(BUILD_TARGET_THUMB) || defined(BUILD_TARGET_THUMB_VFP)
         /* bits[0] of thumb function address must be 1 */
         module->func_ptrs[i] = (void *)((uintptr_t)module->func_ptrs[i] | 1);
@@ -4364,6 +4379,12 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                     bh_assert(mirrored_text != NULL);
                     bh_memcpy_s(mirrored_text, (uint32)total_size,
                                 section->section_body, (uint32)section_size);
+                    /* XUANSI VENDORED PATCH #4 (B10-T2)：S3 上 D→I 面即時
+                     * 同步（寫回 D 面＋作廢 I 面——esp_cache_msync；ROM 的
+                     * 全域 cache 輪舞實測殺 systimer，已退役為 no-op）。
+                     * 載入器後續經 I 面讀 text（literal/code）——先同步。 */
+                    void xuansi_sync_exec(void *exec, size_t len);
+                    xuansi_sync_exec(aot_text, total_size);
                     os_dcache_flush();
 #else
                     bh_memcpy_s(aot_text, (uint32)total_size,
@@ -4373,8 +4394,15 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                     destroy_aot_text = true;
 
                     if ((uint32)total_size > section->section_body_size) {
+                        /* XUANSI VENDORED PATCH #4 (B10-T2): 執行映射不可寫
+                         * ——PLT 尾部補零寫入走 D-bus 鏡像。 */
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0) && defined(CONFIG_IDF_TARGET_ESP32S3)
+                        memset(os_get_dbus_mirror(aot_text) + (uint32)section_size,
+                               0, (uint32)total_size - section_size);
+#else
                         memset(aot_text + (uint32)section_size, 0,
                                (uint32)total_size - section_size);
+#endif
                         section->section_body_size = (uint32)total_size;
                     }
                 }
