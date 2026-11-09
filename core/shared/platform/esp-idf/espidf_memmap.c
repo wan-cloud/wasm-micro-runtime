@@ -294,16 +294,68 @@ void *xuansi_exec_alias(void *dbus_ptr)
     return dbus_ptr;
 }
 
+/* XUANSI (H1 finding, verified on board 2026-11-08): esp_cache_msync()
+ * requires addr % line == 0 && size % line == 0 and returns
+ * ESP_ERR_INVALID_ARG (258) otherwise, and the M2C direction rejects
+ * ESP_CACHE_MSYNC_FLAG_UNALIGNED outright. The loader's length is only
+ * 4-byte aligned (total_size = (n + 3) & ~3), so both raw msync pairs
+ * below used to return 258 and the sync silently did nothing.
+ *
+ * Fix: round [off, off + len) outward to cache-line boundaries (line size
+ * queried at runtime, max of I/D; 32 B for both on ESP32-S3 external
+ * memory), clamped to the mapping - map_size is page-aligned, so the
+ * clamp keeps line alignment. With this helper both msyncs return ESP_OK
+ * (measured) and AOT load proceeds past the point where it used to wedge.
+ * Upstreamable candidate (deferred until A0-A3 verified). */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+static void
+xuansi_msync_pair(const xuansi_exec_map_t *m, uint32_t off, uint32_t len)
+{
+    int dline = 32, iline = 32;
+    uint32_t line, start, end;
+
+    if (m == NULL || len == 0)
+        return;
+    esp_cache_get_dcache_line_size(&dline);
+    esp_cache_get_icache_line_size(&iline);
+    line = (uint32_t)(dline > iline ? dline : iline);
+    if (line == 0)
+        line = 32;
+
+    start = off & ~(line - 1);
+    end = (off + len + line - 1) & ~(line - 1);
+    if (end > m->map_size)
+        end = m->map_size;
+    if (end <= start)
+        return;
+
+    /* write back the D alias, invalidate (and refill) the I alias */
+    esp_cache_msync((uint8_t *)m->dbus + start, end - start,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M
+                        | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    esp_cache_msync((uint8_t *)m->exec + start, end - start,
+                    ESP_CACHE_MSYNC_FLAG_DIR_M2C
+                        | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+}
+#endif /* CONFIG_IDF_TARGET_ESP32S3 */
+
 static void xuansi_sync_dbus_impl(void *dbus_base, size_t len)
 {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     if (dbus_base == NULL || len == 0) return;
-    void *exec = xuansi_exec_alias(dbus_base);
-    if (exec == dbus_base) return;   /* 不在映射表內 */
-    esp_cache_msync(dbus_base, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M
-                                     | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-    esp_cache_msync(exec, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C
-                                 | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+    for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
+        xuansi_exec_map_t *m = &s_xuansi_maps[i];
+        if (m->exec == NULL) continue;
+        if ((uint8_t *)dbus_base >= (uint8_t *)m->dbus
+            && (uint8_t *)dbus_base < (uint8_t *)m->dbus + m->map_size) {
+            uint32_t off =
+                (uint32_t)((uint8_t *)dbus_base - (uint8_t *)m->dbus);
+            uint32_t rest = (uint32_t)m->map_size - off;
+            if (len > rest) len = rest;
+            xuansi_msync_pair(m, off, len);
+            return;
+        }
+    }
 #endif
 }
 
@@ -316,11 +368,7 @@ void xuansi_sync_exec(void *ptr, size_t len)
         uint32_t off = (uint32_t)(base - (uint8_t *)m->exec);
         uint32_t rest = (uint32_t)m->map_size - off;
         if (len > rest) len = rest;
-        uint8_t *dbase = (uint8_t *)m->dbus + off;
-        esp_cache_msync(dbase, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M
-                                         | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-        esp_cache_msync(base, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C
-                                     | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+        xuansi_msync_pair(m, off, len);
         return;
     }
     xuansi_sync_dbus_impl(ptr, len);
@@ -343,11 +391,7 @@ os_icache_flush(void *start, size_t len)
     uint32_t off = (uint32_t)(base - (uint8_t *)m->exec);
     uint32_t rest = (uint32_t)m->map_size - off;
     if (len > rest) len = rest;
-    uint8_t *dbase = (uint8_t *)m->dbus + off;
-    esp_cache_msync(dbase, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M
-                                     | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-    esp_cache_msync(base, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C
-                                     | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+    xuansi_msync_pair(m, off, len);
 #else
     (void)start;
     (void)len;
