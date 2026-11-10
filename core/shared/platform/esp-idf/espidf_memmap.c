@@ -436,6 +436,69 @@ xuansi_munmap_exec(void *ptr)
     m->map_size = 0;
     return 1;
 }
+
+/* XUANSI VENDORED PATCH #15 (P3-T11, 2026-11-10) — release path for
+ * the surgery literal pool (the P3-T11 board unload defect).
+ *
+ * The T10 surgery pool allocation (os_mmap(PROT_XUANSI_PSRAM,
+ * non-EXEC), below) hands out a RAW heap_caps_malloc(SPIRAM|8BIT)
+ * pointer with NO origin header — deliberately so: the pool is pure
+ * data and never goes near the I-window. But every other non-EXEC
+ * os_mmap() product on this platform uses the upstream origin-header
+ * layout (size + 4 + sizeof(ptr), origin stored at ptr-4), and
+ * os_free() (espidf_malloc.c) unwraps that header unconditionally.
+ * aot_unload() releases the pool with os_munmap(literal), whose three
+ * S3 branches (IRAM reserve, exec window table, generic) all miss the
+ * raw pointer, so it fell through to os_free(): *(pool-4) reads the
+ * heap block's own size field (0xF4 = 244 = the ledwatch pool size)
+ * and free(0xF4) dies in a heap assert -> board panic (board
+ * evidence: gdb backtrace aot_unload -> os_munmap -> os_free with
+ * ptr=0xf4, captured at the consumer's instruction-level
+ * root-cause session). The same fallthrough fires
+ * on the load-failure cleanup path (hello import refusal), which is
+ * why every unload-class matrix leg hung.
+ *
+ * Fix (root-cause option (b), narrowest face): a small exact-match
+ * registry of live pool pointers. os_mmap() registers what it handed
+ * out (exhaustion = honest NULL, the patch-#11 discipline — a pool we
+ * cannot account for would be a guaranteed unload panic later);
+ * os_munmap() gains a fourth branch that releases a registered pool
+ * with heap_caps_free() and NEVER reaches the header-unwrap path.
+ * STOCK semantics are untouched: stock containers never set
+ * MMAP_PROT_XUANSI_PSRAM, so neither the registry nor the branch can
+ * see a stock pointer. Host builds cannot catch this class (posix
+ * os_munmap frees directly, no header convention) — the proof lives
+ * in the board unload/reload cycles. */
+#define XUANSI_POOL_MAX 4 /* concurrent surgery modules; the fw loads one at a time */
+static void *s_xuansi_pools[XUANSI_POOL_MAX];
+
+/* returns 1 when the pointer was a registered pool and is now freed */
+static int
+xuansi_munmap_pool(void *ptr)
+{
+    for (int i = 0; i < XUANSI_POOL_MAX; i++) {
+        if (s_xuansi_pools[i] == ptr) {
+            heap_caps_free(ptr);
+            s_xuansi_pools[i] = NULL;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* returns 0 on success; -1 when the registry is full (caller must
+ * free the allocation and fail the mapping honestly) */
+static int
+xuansi_pool_register(void *ptr)
+{
+    for (int i = 0; i < XUANSI_POOL_MAX; i++) {
+        if (s_xuansi_pools[i] == NULL) {
+            s_xuansi_pools[i] = ptr;
+            return 0;
+        }
+    }
+    return -1;
+}
 #endif /* CONFIG_IDF_TARGET_ESP32S3 */
 
 void *
@@ -457,9 +520,17 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
     if (prot & MMAP_PROT_XUANSI_PSRAM) {
         /* XUANSI (P3-T10): 手術版 literal 池＝純資料，PSRAM 一般資料堆
          * （heap_caps SPIRAM；主人裁定 2026-11-10）。池不經 esp_mmu_map
-         * ——資料讀取走 D 窗本就安全。分配歸零（修補 #8 紀律）。 */
+         * ——資料讀取走 D 窗本就安全。分配歸零（修補 #8 紀律）。
+         * XUANSI (patch #15): the RAW pointer (no origin header) must be
+         * registered so os_munmap() releases it with heap_caps_free()
+         * instead of the header-unwrap fallthrough (see the registry
+         * note above); registry exhaustion fails the load honestly. */
         void *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!buf) {
+            return NULL;
+        }
+        if (xuansi_pool_register(buf) != 0) {
+            heap_caps_free(buf);
             return NULL;
         }
         memset(buf, 0, size);
@@ -568,6 +639,13 @@ os_munmap(void *addr, size_t size)
      * os_mmap(EXEC) 返回 **dbus** 指針（修補 #3）——收帳查找須涵蓋
      * dbus 域（追收 #9，見 xuansi_munmap_exec 注記）。 */
     if (xuansi_munmap_exec(ptr)) {
+        return;
+    }
+    /* XUANSI (patch #15): 手術版 literal 池＝裸 heap_caps 指針（無 origin
+     * header）——精確命中登記表即 heap_caps_free 直釋，**絕不**落到
+     * os_free 的 header 解包路（讀池前 4B＝heap 塊自身 size 欄位＝
+     * free(0xF4) 崩潰；見上方登記表注記）。 */
+    if (xuansi_munmap_pool(ptr)) {
         return;
     }
 #endif
