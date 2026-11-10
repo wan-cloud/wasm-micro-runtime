@@ -213,6 +213,14 @@ print_help()
     printf("  --enable-linux-perf       Enable linux perf support\n");
 #endif
     printf("  --mllvm=<option>          Add the LLVM command line option\n");
+    printf("                            (a leading '-' is required by LLVM and\n");
+    printf("                            added automatically if missing)\n");
+    printf("  --enable-xuansi-surgery   Force the xuansi A3 surgery shape ON\n");
+    printf("                            (literal pool in the xuansi.literal\n");
+    printf("                            section; default ON for xtensa)\n");
+    printf("  --disable-xuansi-surgery  Emit a stock container (text-embedded\n");
+    printf("                            literal block) and roll the LLVM\n");
+    printf("                            literal-base codegen back off\n");
     printf("  --enable-shared-heap      Enable shared heap feature, assuming only one shared heap will be attached\n");
     printf("  --enable-shared-chain     Enable shared heap chain feature, works for more than one shared heap\n");
     printf("                            WARNING: enable this feature will largely increase code size\n");
@@ -400,6 +408,8 @@ main(int argc, char *argv[])
     char error_buf[128];
     int log_verbose_level = 2;
     bool sgx_mode = false, size_level_set = false, use_dummy_wasm = false;
+    /* XUANSI (P3-T10): -1 = not forced on the command line */
+    int xuansi_surgery_explicit = -1;
     int exit_status = EXIT_FAILURE;
 #if BH_HAS_DLFCN
     const char *native_lib_list[8] = { NULL };
@@ -650,6 +660,19 @@ main(int argc, char *argv[])
             void *np;
             if (argv[0][8] == '\0')
                 PRINT_HELP_AND_EXIT();
+            /* XUANSI (P3-T10 rider): LLVM cl options need their leading
+             * '-' (LLVMParseCommandLineOptions silently ignores a bare
+             * "name=value" — the A/B leg of the T9 workflow once ran a
+             * no-op flag this way).  Normalize instead of trusting the
+             * spelling. */
+            if (argv[0][8] != '-') {
+                char fixed[256];
+                snprintf(fixed, sizeof(fixed), "--mllvm=-%s", argv[0] + 8);
+                LOG_WARNING("mllvm option '%s' lacks the leading '-'; "
+                            "using '%s'",
+                            argv[0] + 8, fixed + 8);
+                strcpy(argv[0], fixed);
+            }
             if (llvm_options_count == 0)
                 llvm_options_count += 2;
             else
@@ -663,6 +686,15 @@ main(int argc, char *argv[])
             if (llvm_options_count == 2)
                 llvm_options[llvm_options_count - 2] = "wamrc";
             llvm_options[llvm_options_count - 1] = argv[0] + 8;
+        }
+        else if (!strcmp(argv[0], "--enable-xuansi-surgery")) {
+            /* XUANSI (P3-T10): force the surgery container shape +
+             * codegen mode on (see the resolution block before the
+             * compile for the default and the precedence rules) */
+            xuansi_surgery_explicit = 1;
+        }
+        else if (!strcmp(argv[0], "--disable-xuansi-surgery")) {
+            xuansi_surgery_explicit = 0;
         }
         else if (!strcmp(argv[0], "--enable-shared-heap")) {
             option.enable_shared_heap = true;
@@ -771,6 +803,76 @@ main(int argc, char *argv[])
     native_handle_count = load_and_register_native_libs(
         native_lib_list, native_lib_count, native_handle_list);
 #endif
+
+    /*
+     * XUANSI (P3-T10): resolve the surgery mode.  One switch governs
+     * BOTH halves — the container shape (literal pool into the
+     * xuansi.literal CUSTOM section, text literal_size == 0, emitted by
+     * this fork's aot_emit_aot_file.c) and the LLVM codegen mode
+     * (literal-base addressing, LLVM fork xuansi/a3-surgery, default
+     * ON for xtensa) — so they can never disagree into a broken
+     * hybrid.  Precedence:
+     *   1. --enable/--disable-xuansi-surgery (this binary);
+     *   2. an explicit --mllvm=-xuansi-literal-base=<v>;
+     *   3. default: ON for the xtensa target (mirrors the LLVM fork
+     *      default), OFF otherwise.
+     * Disabling appends "-xuansi-literal-base=0" to the LLVM options
+     * below unless the user already set it, keeping the codegen and
+     * the container in lockstep.  NOTE: the default-ON assumes the
+     * fork LLVM; building this wamrc against a foreign LLVM for
+     * xtensa requires --disable-xuansi-surgery (the foreign backend
+     * has no literal-base mode).
+     */
+    {
+        bool target_is_xtensa =
+            option.target_arch && !strcmp(option.target_arch, "xtensa");
+        int mllvm_surgery = -1;
+        uint32 li;
+        static const char xuansi_flag[] = "-xuansi-literal-base=";
+        for (li = 0; li < (uint32)llvm_options_count; li++) {
+            const char *o = llvm_options[li];
+            if (li == 0) /* the "wamrc" argv[0] slot */
+                continue;
+            if (!strncmp(o, xuansi_flag, sizeof(xuansi_flag) - 1)) {
+                mllvm_surgery =
+                    atoi(o + sizeof(xuansi_flag) - 1) ? 1 : 0;
+            }
+        }
+
+        bool surgery = target_is_xtensa;
+        if (mllvm_surgery != -1)
+            surgery = mllvm_surgery != 0;
+        if (xuansi_surgery_explicit != -1)
+            surgery = xuansi_surgery_explicit != 0;
+
+        if (surgery && !target_is_xtensa)
+            LOG_WARNING("xuansi surgery on a non-xtensa target: the "
+                        "container shape is split but this target's "
+                        "codegen has no literal-base mode (loader-test "
+                        "containers only)");
+
+        if (!surgery && target_is_xtensa && mllvm_surgery != 0) {
+            /* roll the codegen back together with the container shape */
+            void *np = realloc(
+                llvm_options,
+                (llvm_options_count + 1) * sizeof(char *));
+            if (np == NULL) {
+                printf("Memory allocation failure\n");
+                goto fail0;
+            }
+            llvm_options = np;
+            if (llvm_options_count == 0)
+                llvm_options[llvm_options_count++] = "wamrc";
+            llvm_options[llvm_options_count++] =
+                (char *)"-xuansi-literal-base=0";
+        }
+
+        option.xuansi_split_literal = surgery;
+        printf("xuansi surgery mode: %s (container %s)\n",
+               surgery ? "ON" : "OFF",
+               surgery ? "literal pool -> xuansi.literal section"
+                       : "stock (literal embedded in text)");
+    }
 
     if (llvm_options_count > 0)
         LLVMParseCommandLineOptions(llvm_options_count,

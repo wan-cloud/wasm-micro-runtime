@@ -93,6 +93,8 @@ typedef struct AOTCompOption {
     const char *stack_usage_file;
     const char *llvm_passes;
     const char *builtin_intrinsics;
+    /* XUANSI (P3-T10): surgery container shape (see AOTCompContext) */
+    bool xuansi_split_literal;
 } AOTCompOption, *aot_comp_option_t;
 
 #ifdef __cplusplus

@@ -410,6 +410,15 @@ typedef struct AOTCompContext {
     bool is_indirect_mode;
     bh_list native_symbols;
 
+    /* XUANSI (P3-T10): emit the literal pool into the xuansi.literal
+     * CUSTOM section and write text literal_size == 0 (surgery
+     * container shape; see the loader in aot_loader.c and the LLVM
+     * fork's literal-base codegen).  Default mirrors the LLVM fork's
+     * default (ON for xtensa): the codegen and the container shape
+     * must always agree, so both sides switch together via wamrc's
+     * --enable/--disable-xuansi-surgery. */
+    bool xuansi_split_literal;
+
     /* Bulk memory feature */
     bool enable_bulk_memory;
 

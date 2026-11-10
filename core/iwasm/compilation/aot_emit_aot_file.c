@@ -812,10 +812,18 @@ get_init_data_section_size(AOTCompContext *comp_ctx, AOTCompData *comp_data,
 }
 
 static uint32
-get_text_section_size(AOTObjectData *obj_data)
+get_text_section_size(AOTCompContext *comp_ctx, AOTObjectData *obj_data)
 {
-    return sizeof(uint32) + align_uint(obj_data->literal_size, 4)
-           + align_uint(obj_data->text_size, 4)
+    /* XUANSI (P3-T10): in surgery mode the literal block moves to the
+     * xuansi.literal CUSTOM section; the text section keeps the layout
+     * [literal_size field][code] with the field written as 0 (the
+     * loader's discrimination table keys on it). */
+    uint32 literal_part =
+        sizeof(uint32)
+        + (comp_ctx->xuansi_split_literal
+               ? 0
+               : align_uint(obj_data->literal_size, 4));
+    return literal_part + align_uint(obj_data->text_size, 4)
            + align_uint(obj_data->text_unlikely_size, 4)
            + align_uint(obj_data->text_hot_size, 4);
 }
@@ -1208,6 +1216,11 @@ get_string_literal_section_size(AOTCompContext *comp_ctx,
 static uint32
 get_custom_sections_size(AOTCompContext *comp_ctx, AOTCompData *comp_data);
 
+/* XUANSI (P3-T10) */
+static uint32
+get_xuansi_literal_section_size(AOTCompContext *comp_ctx,
+                                AOTObjectData *obj_data);
+
 uint32
 aot_get_aot_file_size(AOTCompContext *comp_ctx, AOTCompData *comp_data,
                       AOTObjectData *obj_data)
@@ -1237,7 +1250,7 @@ aot_get_aot_file_size(AOTCompContext *comp_ctx, AOTCompData *comp_data,
     size = align_uint(size, 4);
     /* section id + section size */
     size += (uint32)sizeof(uint32) * 2;
-    size += get_text_section_size(obj_data);
+    size += get_text_section_size(comp_ctx, obj_data);
 
     /* function section */
     size = align_uint(size, 4);
@@ -1250,6 +1263,19 @@ aot_get_aot_file_size(AOTCompContext *comp_ctx, AOTCompData *comp_data,
     /* section id + section size */
     size += (uint32)sizeof(uint32) * 2;
     size += get_export_section_size(comp_ctx, comp_data);
+
+    /* XUANSI (P3-T10): surgery literal pool CUSTOM section, emitted
+     * between EXPORT and RELOCATION so the loader places the pool
+     * before relocations are applied (and so an older runtime — whose
+     * section-order rule only accepts customs after all numbered
+     * sections — rejects the container with "invalid section order"
+     * instead of ever running it). */
+    if (comp_ctx->xuansi_split_literal) {
+        size = align_uint(size, 4);
+        /* section id + section size */
+        size += (uint32)sizeof(uint32) * 2;
+        size += get_xuansi_literal_section_size(comp_ctx, obj_data);
+    }
 
     /* relocation section */
     size = align_uint(size, 4);
@@ -2471,7 +2497,8 @@ static bool
 aot_emit_text_section(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
                       AOTCompData *comp_data, AOTObjectData *obj_data)
 {
-    uint32 section_size = get_text_section_size(obj_data);
+    uint32 section_size =
+        get_text_section_size(obj_data->comp_ctx, obj_data);
     uint32 offset = *p_offset;
     uint8 placeholder = 0;
     AOTRelocationGroup *relocation_group;
@@ -2483,9 +2510,14 @@ aot_emit_text_section(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
 
     EMIT_U32(AOT_SECTION_TYPE_TEXT);
     EMIT_U32(section_size);
-    EMIT_U32(obj_data->literal_size);
+    /* XUANSI (P3-T10): surgery keeps the literal_size field but writes
+     * 0 — the container-shape marker the loader discriminates on.  The
+     * literal bytes travel in the xuansi.literal CUSTOM section. */
+    EMIT_U32(obj_data->comp_ctx->xuansi_split_literal ? 0
+                                                      : obj_data->literal_size);
 
-    if (obj_data->literal_size > 0) {
+    if (!obj_data->comp_ctx->xuansi_split_literal
+        && obj_data->literal_size > 0) {
         EMIT_BUF(obj_data->literal, obj_data->literal_size);
         while (offset & 3)
             EMIT_BUF(&placeholder, 1);
@@ -2937,6 +2969,58 @@ aot_emit_string_literal_section(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
     return true;
 }
 #endif /* end of WASM_ENABLE_STRINGREF != 0 */
+
+/*
+ * XUANSI (P3-T10): the surgery literal pool section (CUSTOM,
+ * AOT_CUSTOM_SECTION_RAW, name "xuansi.literal").  Emitted between the
+ * EXPORT and RELOCATION sections: the loader places the pool before it
+ * applies relocations, and an older runtime rejects the order honestly.
+ * Body layout: sub section id (u32) + name string + pool bytes padded
+ * to 4.
+ */
+static uint32
+get_xuansi_literal_section_size(AOTCompContext *comp_ctx,
+                                AOTObjectData *obj_data)
+{
+    (void)comp_ctx;
+    /* sub section id + string (len + content + '\0', padded to 4 so the
+     * pool bytes start 4-aligned in the file) + padded pool */
+    return (uint32)sizeof(uint32)
+           + align_uint(get_string_size(comp_ctx, XUANSI_LITERAL_SECTION_NAME),
+                        4)
+           + align_uint(obj_data->literal_size, 4);
+}
+
+static bool
+aot_emit_xuansi_literal_section(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
+                                AOTCompContext *comp_ctx,
+                                AOTObjectData *obj_data)
+{
+    uint32 section_size = get_xuansi_literal_section_size(comp_ctx, obj_data);
+    uint32 offset = *p_offset;
+    uint8 placeholder = 0;
+
+    *p_offset = offset = align_uint(offset, 4);
+
+    EMIT_U32(AOT_SECTION_TYPE_CUSTOM);
+    EMIT_U32(section_size);
+    EMIT_U32(AOT_CUSTOM_SECTION_RAW);
+    EMIT_STR(XUANSI_LITERAL_SECTION_NAME);
+    while (offset & 3) /* pad the name so the pool starts 4-aligned */
+        EMIT_BUF(&placeholder, 1);
+    EMIT_BUF(obj_data->literal, obj_data->literal_size);
+    while (offset & 3)
+        EMIT_BUF(&placeholder, 1);
+
+    if (offset - *p_offset != section_size + sizeof(uint32) * 2) {
+        aot_set_last_error("emit xuansi literal section failed.");
+        return false;
+    }
+
+    *p_offset = offset;
+
+    return true;
+}
 
 static bool
 aot_emit_custom_sections(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
@@ -4589,6 +4673,13 @@ aot_emit_aot_file_buf_ex(AOTCompContext *comp_ctx, AOTCompData *comp_data,
                                   obj_data)
         || !aot_emit_export_section(buf, buf_end, &offset, comp_ctx, comp_data,
                                     obj_data)
+        /* XUANSI (P3-T10): surgery pool section between EXPORT and
+         * RELOCATION (loader places the pool before relocations; older
+         * runtimes reject the order honestly) */
+        || (comp_ctx->xuansi_split_literal
+                ? !aot_emit_xuansi_literal_section(buf, buf_end, &offset,
+                                                   comp_ctx, obj_data)
+                : false)
         || !aot_emit_relocation_section(buf, buf_end, &offset, comp_ctx,
                                         comp_data, obj_data)
         || !aot_emit_native_symbol(buf, buf_end, &offset, comp_ctx)

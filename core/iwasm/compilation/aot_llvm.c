@@ -2751,6 +2751,11 @@ aot_create_comp_context(const AOTCompData *comp_data, aot_comp_option_t option)
         comp_ctx->disable_llvm_jump_tables = true;
     }
 
+    /* XUANSI (P3-T10): surgery container shape (default resolved by the
+     * wamrc front end so the codegen flag and the container shape can
+     * never disagree; see wamr-compiler/main.c). */
+    comp_ctx->xuansi_split_literal = option->xuansi_split_literal;
+
     if (option->disable_llvm_intrinsics)
         comp_ctx->disable_llvm_intrinsics = true;
 
