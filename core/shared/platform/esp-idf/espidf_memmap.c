@@ -137,12 +137,136 @@ static uint8_t s_xuansi_aot_exec[XUANSI_AOT_EXEC_RESERVE_BYTES]
     __attribute__((section(".iram1"), aligned(16)));
 static uint8_t s_xuansi_aot_exec_used;
 
+/* XUANSI VENDORED PATCH #13 (P3-T6w, 2026-11-10) — survive PMS
+ * write-protection of the IRAM0 text span.
+ *
+ * The reserve lives in .iram1 (inside .iram0.text, below _iram_text_end)
+ * because that is the only internal-SRAM span the S3 memory protection
+ * leaves executable. Whenever the restrictive PMS configuration is active
+ * that span is also WRITE-DENIED (W^X). The loader writing the reserve
+ * then raises an IRAM0 PMS violation whose interrupt source is routed to
+ * ETS_MEMACCESS_ERR_INUM - the SAME inum as the cache-error sources - so
+ * xt_highint4 classifies it as PANIC_RSN_CACHEERR. A PMS violation leaves
+ * the cache access-error statuses empty, esp_cache_err_acs_save_and_clr()
+ * returns -1, and the panic arbitration parks this core (APP) in
+ * busy_wait() at INTLEVEL 5 waiting for a core that never panics: a
+ * whole-board freeze, int-wdt reboot on release builds. (Board evidence
+ * 2026-11-10: CORE_1_IRAM0_PMS_MONITOR_2 = {VIOLATE_INTR, WR, LOADSTORE,
+ * ADDR 0x4037bf50 = the reserve base}; the store itself is CANCELLED -
+ * pattern readback read zero.)
+ * Two layers keep the board alive and the failure honest:
+ *   (a) write-probe the requested span up front (a write-denied store
+ *       silently cancels) - refuse the mapping, no interrupt ever fires;
+ *   (b) across the whole load window, unroute the four per-core PMS
+ *       violation sources (to the invalid inum) and clear latched
+ *       violations on exit, so a mid-load state flip degrades to a
+ *       corrupt-text load failure instead of the panic-path deadlock.
+ * The enforcement state varies across boots ("wedge phases" vs "green
+ * phases", hours-scale, root not identified - it is not any fw/fork
+ * code); the probe makes both phases safe and reports which one is live. */
+#include "soc/interrupts.h"
+#include "soc/sensitive_reg.h"
+
+static uint8_t s_xuansi_pms_guard_depth;
+static uint8_t s_xuansi_pms_unrouted;
+
+/* Unroute the four per-core PMS violation sources to the invalid inum.
+ * Once per boot (the unrouted state is kept for the whole boot: a latched
+ * violation keeps its line asserted, and re-arming the routing while hot
+ * would deliver the very interrupt we are defending against; a board
+ * session with the sources unrouted was verified stable - the stores
+ * stay DENIED either way, only the (broken) panic reporting is muted). */
+static void
+xuansi_pms_unroute_once(void)
+{
+    extern void esp_rom_route_intr_matrix(int cpu_core,
+                                          uint32_t periph_intr_id,
+                                          uint32_t cpu_intr_num);
+    if (s_xuansi_pms_unrouted) {
+        return;
+    }
+    s_xuansi_pms_unrouted = 1;
+    esp_rom_route_intr_matrix(1, ETS_CORE1_IRAM0_PMS_INTR_SOURCE,
+                              ETS_INVALID_INUM);
+    esp_rom_route_intr_matrix(1, ETS_CORE1_DRAM0_PMS_INTR_SOURCE,
+                              ETS_INVALID_INUM);
+    esp_rom_route_intr_matrix(0, ETS_CORE0_IRAM0_PMS_INTR_SOURCE,
+                              ETS_INVALID_INUM);
+    esp_rom_route_intr_matrix(0, ETS_CORE0_DRAM0_PMS_INTR_SOURCE,
+                              ETS_INVALID_INUM);
+}
+
+static void
+xuansi_pms_guard_enter(void)
+{
+    if (s_xuansi_pms_guard_depth++ != 0) {
+        return;
+    }
+    xuansi_pms_unroute_once();
+}
+
+/* Close the window: swallow anything latched (write-1-to-clear). The
+ * routing stays unrouted for the rest of the boot (see unroute_once). */
+static void
+xuansi_pms_guard_exit(void)
+{
+    if (s_xuansi_pms_guard_depth == 0 || --s_xuansi_pms_guard_depth != 0) {
+        return;
+    }
+    REG_SET_BIT(SENSITIVE_CORE_0_IRAM0_PMS_MONITOR_1_REG,
+                SENSITIVE_CORE_0_IRAM0_PMS_MONITOR_VIOLATE_CLR);
+    REG_SET_BIT(SENSITIVE_CORE_1_IRAM0_PMS_MONITOR_1_REG,
+                SENSITIVE_CORE_1_IRAM0_PMS_MONITOR_VIOLATE_CLR);
+    REG_SET_BIT(SENSITIVE_CORE_0_DRAM0_PMS_MONITOR_1_REG,
+                SENSITIVE_CORE_0_DRAM0_PMS_MONITOR_VIOLATE_CLR);
+    REG_SET_BIT(SENSITIVE_CORE_1_DRAM0_PMS_MONITOR_1_REG,
+                SENSITIVE_CORE_1_DRAM0_PMS_MONITOR_VIOLATE_CLR);
+}
+
+/* Pattern-write/readback probe over the first/last words of the span
+ * (permission granularity is the PMS slot/category, far coarser than the
+ * span, so two words cover it). Returns 1 when the stores land. */
+static int
+xuansi_region_writable(size_t size)
+{
+    volatile uint32_t *b = (volatile uint32_t *)(void *)s_xuansi_aot_exec;
+    size_t words = size / sizeof(uint32_t);
+    if (words == 0) {
+        words = 1;
+    }
+    uint32_t f = b[0], l = b[words - 1];
+    b[0] = 0xA5A5F00Fu;
+    b[words - 1] = 0x0F5AA5A5u;
+    int ok = (b[0] == 0xA5A5F00Fu) && (b[words - 1] == 0x0F5AA5A5u);
+    b[0] = f;
+    b[words - 1] = l;
+    return ok;
+}
+
 /* Single source for the fw-side budget gate and the caps advertisement
  * (aot_exec_budget_bytes): the fw must not hand-copy the reserve size. */
 uint32_t
 xuansi_aot_exec_budget(void)
 {
     return (uint32_t)XUANSI_AOT_EXEC_RESERVE_BYTES;
+}
+
+/* Single source for the fw-side pre-gate (patch #13): probe whether the
+ * reserve span is writable this boot, without disturbing resident text
+ * (a resident module implies the probe passed for it; do not touch it). */
+int
+xuansi_aot_exec_writable(uint32_t size)
+{
+    if (size == 0 || size > XUANSI_AOT_EXEC_RESERVE_BYTES) {
+        return 0;
+    }
+    if (s_xuansi_aot_exec_used) {
+        return 1;
+    }
+    xuansi_pms_guard_enter();
+    int ok = xuansi_region_writable(size);
+    xuansi_pms_guard_exit();
+    return ok;
 }
 
 static int
@@ -162,6 +286,14 @@ xuansi_mmap_exec_region(size_t size)
     if (s_xuansi_aot_exec_used) {
         return NULL;   /* single-occupancy slot is taken (unload first) */
     }
+    /* patch #13: guard first (the probe's own denied write would raise
+     * the very interrupt we are defending against), then probe, then
+     * zero-on-alloc. Probe failure closes the guard before returning. */
+    xuansi_pms_guard_enter();
+    if (!xuansi_region_writable(size)) {
+        xuansi_pms_guard_exit();
+        return NULL;   /* PMS write-denies the span this boot */
+    }
     s_xuansi_aot_exec_used = 1;
     memset(s_xuansi_aot_exec, 0, size);
     return s_xuansi_aot_exec;
@@ -180,6 +312,7 @@ xuansi_munmap_exec_region(void *ptr)
         return 0;
     }
     s_xuansi_aot_exec_used = 0;
+    xuansi_pms_guard_exit();   /* patch #13: close the write window */
     return 1;
 }
 
@@ -590,6 +723,9 @@ os_icache_flush(void *start, size_t len)
      * 無雙匯流排鏡像）。 */
     if (xuansi_ptr_in_aot_exec(start)) {
         xuansi_sync_exec_region(start, len);
+        /* patch #13: aot_load_from_aot_file ends the load here (this is
+         * the last touch of the region); close the PMS write window. */
+        xuansi_pms_guard_exit();
         return;
     }
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(start);
