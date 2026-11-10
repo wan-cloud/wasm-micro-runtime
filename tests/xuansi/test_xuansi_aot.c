@@ -222,6 +222,158 @@ transform_to_surgery(const uint8 *buf, uint32 size, uint32 *p_out_size)
 }
 
 /* ------------------------------------------------------------------ */
+/* XUANSI (P3-T11, patch #15): unload-path accounting vectors          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The board defect (an mmap/munmap routing asymmetry root-caused at
+ * instruction level in the consumer project)
+ * was an mmap/munmap ROUTING asymmetry in the esp-idf platform: the
+ * raw surgery-pool pointer hit the origin-header fallthrough at unload.
+ * Host builds cannot reproduce that routing (posix os_munmap frees
+ * directly), so these vectors pin the LOADER-SIDE accounting that the
+ * platform routing hangs off — every leg below must hold on every
+ * platform for the board fix to have something to route correctly:
+ *   - a full load->instantiate->call->deinstantiate->unload cycle,
+ *     run TWICE back to back on the same container bytes (module
+ *     fields reset by aot_unload, pool re-placed, slot re-filled);
+ *   - a load failure AFTER the pool was placed (a sabotaged
+ *     RELOCATION section — deterministic "unexpected end" rejection)
+ *     driving the aot_unload cleanup branch that frees the orphaned
+ *     pool, twice in a row, with a healthy load cycle after it.
+ */
+
+/* Sabotage the RELOCATION section of a surgery container (set the
+ * leading symbol_count to a value far past the section end).  The
+ * classifier only reads TEXT + the pool CUSTOM, so the sabotaged
+ * container still classifies SURGERY and passes the kind gate; the
+ * loader then places the pool (CUSTOM precedes RELOCATION, emit
+ * order) and fails inside load_relocation_section ("unexpected
+ * end") — driving the aot_unload branch that must free the orphaned
+ * pool.  Returns a fresh buffer the caller frees, or NULL. */
+static uint8 *
+bomb_relocation_section(const uint8 *buf, uint32 size, uint32 *p_out_size)
+{
+    const uint8 *p = buf + 8, *p_end = buf + size;
+    const uint8 *reloc_at = NULL;
+    uint8 *out;
+
+    while (p + 8 <= p_end) {
+        uint32 type, sec_size;
+        p = (const uint8 *)(((uintptr_t)p + 3) & ~(uintptr_t)3);
+        if (p + 8 > p_end)
+            break;
+        type = rd32(p);
+        sec_size = rd32(p + 4);
+        if (type == 5 /* RELOCATION */ && !reloc_at) {
+            if (sec_size < 4)
+                return NULL; /* nothing to sabotage */
+            reloc_at = p;
+        }
+        p += 8 + sec_size;
+    }
+    if (!reloc_at) {
+        printf("bomb: no RELOCATION section found\n");
+        return NULL;
+    }
+
+    out = malloc(size);
+    if (!out)
+        return NULL;
+    memcpy(out, buf, size);
+    wr32(out + (uint32)(reloc_at - buf) + 8, 0x7FFF0000u);
+    *p_out_size = size;
+    return out;
+}
+
+/* one full load->instantiate->call->deinstantiate->unload round on
+ * the surgery container; asserts every placement contract and returns
+ * 1 when the whole round passed. */
+static bool call_f(wasm_module_inst_t inst, uint32 *p_result);
+
+static int
+surgery_round_trip(uint8 *surgery, uint32 surgery_size, int round)
+{
+    AOTModule *aot;
+    wasm_module_t module;
+    wasm_module_inst_t inst;
+    uint32 result = 0;
+    uint8 *slot_ptr;
+    char err[256];
+
+    module = wasm_runtime_load(surgery, surgery_size, err, sizeof(err));
+    if (!module) {
+        CHECK(0, "cycle: surgery loads");
+        printf("  (round %d load error: %s)\n", round, err);
+        return 0;
+    }
+    CHECK(1, "cycle: surgery loads");
+    aot = (AOTModule *)module;
+    CHECK(aot->xuansi_kind == (uint8)AOT_XUANSI_KIND_SURGERY
+              && aot->xuansi_literal_owned == 1 && aot->literal != NULL
+              && aot->literal_size >= sizeof(pool_pattern),
+          "cycle: pool ownership recorded (fresh after prior unload)");
+    CHECK(memcmp(aot->literal, pool_pattern, sizeof(pool_pattern)) == 0,
+          "cycle: pool content matches the emitter bytes");
+    CHECK(aot->literal < (uint8 *)aot->code
+              || aot->literal >= (uint8 *)aot->code + aot->code_size,
+          "cycle: pool outside the text mapping");
+    inst = wasm_runtime_instantiate(module, 8192, 8192, err, sizeof(err));
+    CHECK(inst != NULL, "cycle: instantiates");
+    if (inst) {
+        slot_ptr = *(uint8 **)((uint8 *)inst + XUANSI_LITERAL_BASE_SLOT);
+        CHECK(slot_ptr == aot->literal, "cycle: instance slot == pool");
+        CHECK(call_f(inst, &result) && result == 77,
+              "cycle: f() == 77 after a prior unload");
+        wasm_runtime_deinstantiate(inst);
+    }
+    wasm_runtime_unload(module); /* frees text mapping + pool */
+    return 1;
+}
+
+static void
+unload_accounting_vectors(uint8 *surgery, uint32 surgery_size)
+{
+    uint8 *dup;
+    uint32 dup_size = 0;
+    char err[256];
+
+    printf("  -- unload/reload cycle x2 (patch #15 accounting)\n");
+    for (int round = 1; round <= 2; round++) {
+        if (!surgery_round_trip(surgery, surgery_size, round))
+            break;
+    }
+
+    printf("  -- load-failure cleanup after pool placement (x2)\n");
+    dup = bomb_relocation_section(surgery, surgery_size, &dup_size);
+    CHECK(dup != NULL, "relocation-bomb container built");
+    if (dup) {
+        for (int i = 1; i <= 2; i++) {
+            wasm_module_t m;
+            err[0] = '\0';
+            m = wasm_runtime_load(dup, dup_size, err, sizeof(err));
+            CHECK(m == NULL, "post-placement failure rejected (clean)");
+            if (strstr(err, "unexpected end") == NULL) {
+                printf("  (bomb actual error: %s)\n", err);
+            }
+            CHECK(strstr(err, "unexpected end") != NULL,
+                  "post-placement failure refused with the exact message");
+            /* the FIRST pool was placed before the rejection: this leg
+             * drives the aot_unload branch that frees an orphaned pool
+             * (the same cleanup the hello import-refusal takes on the
+             * board). No crash + honest error = the accounting held. */
+        }
+        free(dup);
+
+        /* the container bytes are untouched by the failed loads — a
+         * healthy cycle right after proves nothing leaked INTO the
+         * loader state (registry/fields) that a later load would trip
+         * over */
+        surgery_round_trip(surgery, surgery_size, 3);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* runtime helpers                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -480,6 +632,10 @@ main(int argc, char *argv[])
                                       sizeof(err));
                 CHECK(m == NULL, "truncated surgery rejected");
             }
+
+            /* ---- 3b. unload/reload cycle x2 + load-failure cleanup
+             * (P3-T11 patch #15 accounting — see the vectors above) */
+            unload_accounting_vectors(surgery, surgery_size);
         }
     }
 
@@ -502,6 +658,11 @@ main(int argc, char *argv[])
             free(buf);
         }
     }
+
+    /* fixture hygiene (keeps ASan runs clean; the vectors above own
+     * nothing at this point — every module was unloaded) */
+    free(stock);
+    free(surgery);
 
     printf("\nxuansi_aot_tests: %d checks, %d failures\n", g_checks,
            g_failures);
