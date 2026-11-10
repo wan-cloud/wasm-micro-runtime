@@ -7,6 +7,7 @@
 #include "../compilation/aot_stack_frame.h"
 #include "bh_log.h"
 #include "mem_alloc.h"
+#include "xuansi_aot.h"
 #include "../common/wasm_runtime_common.h"
 #include "../common/wasm_memory.h"
 #include "../interpreter/wasm_runtime.h"
@@ -52,6 +53,27 @@ bh_static_assert(offsetof(AOTModuleInstance, c_api_func_imports)
                  == 13 * sizeof(uint64) + 128 + 7 * sizeof(uint64));
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64));
+
+/*
+ * XUANSI (P3-T10): the surgery literal-base slot and the stock-offset
+ * freeze.  Stock AOT containers bake the offsets asserted above into
+ * generated code; the surgery slot is carved from the reserved[] tail
+ * so none of them move.  These asserts hold in every layout-normalized
+ * build (64-bit host and DefPointer-padded 32-bit target alike); the
+ * interpreter-only 32-bit build never runs AOT code and skips both the
+ * padding and these pins.
+ */
+#if WASM_ENABLE_AOT != 0 || WASM_ENABLE_JIT != 0 \
+    || WASM_ENABLE_WAMR_COMPILER != 0
+bh_static_assert(offsetof(AOTModuleInstance, xuansi_literal_base)
+                 == XUANSI_LITERAL_BASE_SLOT);
+bh_static_assert(XUANSI_LITERAL_BASE_SLOT
+                 == offsetof(AOTModuleInstance, default_wasm_stack_size)
+                        + 2 * sizeof(uint32));
+bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
+                 == XUANSI_LITERAL_BASE_SLOT + sizeof(uint64)
+                        + 4 * sizeof(uint32));
+#endif
 
 bh_static_assert(sizeof(AOTMemoryInstance) == 120);
 bh_static_assert(offsetof(AOTTableInstance, elems) == 24);
@@ -1941,6 +1963,16 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
     module_inst->e =
         (WASMModuleInstanceExtra *)((uint8 *)module_inst + extra_info_offset);
     extra = (AOTModuleInstanceExtra *)module_inst->e;
+
+    /* XUANSI (P3-T10): fill the surgery literal-base slot.  Surgery
+     * codegen reads instance + XUANSI_LITERAL_BASE_SLOT in the prologue
+     * of every pool-referencing function; for surgery containers
+     * module->literal points at the placed pool (PSRAM data heap on the
+     * board, a plain allocation on host builds).  Stock containers
+     * never load the slot; leave it NULL. */
+    module_inst->xuansi_literal_base =
+        (module->xuansi_kind == AOT_XUANSI_KIND_SURGERY) ? module->literal
+                                                         : NULL;
 
 #if WASM_ENABLE_GC != 0
     /* Initialize gc heap first since it may be used when initializing

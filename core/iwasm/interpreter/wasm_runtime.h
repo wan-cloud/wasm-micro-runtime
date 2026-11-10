@@ -461,7 +461,25 @@ struct WASMModuleInstance {
 
     /* Default WASM operand stack size */
     uint32 default_wasm_stack_size;
-    uint32 reserved[7];
+    /* XUANSI (P3-T10): literal pool base slot for A3 surgery containers.
+     * The surgery codegen (LLVM fork xuansi/a3-surgery) loads this field
+     * in every pool-referencing function prologue (l32i base, inst,
+     * XUANSI_LITERAL_BASE_SLOT == 320) and the loader fills it with the
+     * placed pool address at instantiate time.
+     *
+     * PLACEMENT IS LOAD-BEARING: stock AOT containers bake struct
+     * offsets into generated code (memories at 8, func_ptrs at 40,
+     * func_type_indexes at 48, cur_exception at 104, global_table_data
+     * at 344, ...), so no field before global_table_data may ever move.
+     * The slot is carved out of the upstream reserved[7] tail (28
+     * bytes): one u32 spacer puts the pointer at 320 — 8-aligned in the
+     * 64-bit wamrc build AND 4-aligned in the DefPointer-padded 32-bit
+     * target build, so both layouts agree — and reserved shrinks to 4
+     * words.  8 + 4 + 16 == 28: global_table_data stays at 344 and
+     * sizeof stays put.  The static asserts in aot_runtime.c pin this. */
+    uint32 xuansi_reserved0;
+    DefPointer(uint8 *, xuansi_literal_base);
+    uint32 reserved[4];
 
     /*
      * +------------------------------+ <-- memories

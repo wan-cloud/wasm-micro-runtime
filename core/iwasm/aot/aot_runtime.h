@@ -10,6 +10,7 @@
 #include "../common/wasm_runtime_common.h"
 #include "../interpreter/wasm_runtime.h"
 #include "../compilation/aot.h"
+#include "xuansi_aot.h"
 #if WASM_ENABLE_GC != 0
 #include "gc_export.h"
 #endif
@@ -250,6 +251,19 @@ typedef struct AOTModule {
     /* literal for AOTed code */
     uint8 *literal;
     uint32 literal_size;
+
+    /* XUANSI (P3-T10): container kind (see xuansi_aot.h).  STOCK keeps
+     * the stock load path bit-identical; SURGERY routes the text to the
+     * PSRAM exec window and the pool (above) to a separate data-heap
+     * allocation owned by this module (xuansi_literal_owned == true,
+     * freed in aot_unload) instead of pointing into the text mapping. */
+    uint8 xuansi_kind;
+    uint8 xuansi_literal_owned;
+    /* set by load_target_info_section: does the CONTAINER target xtensa?
+     * (drives the literal-layout discrimination rule: on xtensa a
+     * text literal_size == 0 without the xuansi.literal section is
+     * malformed; other targets legitimately have no literal block) */
+    bool xuansi_is_xtensa;
 
 #if defined(BH_PLATFORM_WINDOWS)
     /* extra plt data area for __ymm, __xmm and __real constants
