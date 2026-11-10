@@ -296,11 +296,16 @@ loader_malloc(uint64 size, char *error_buf, uint32 error_buf_size)
     return mem;
 }
 
+/* XUANSI (P3-T10): xuansi_psram adds MMAP_PROT_XUANSI_PSRAM so the
+ * esp-idf S3 platform routes the mapping to the PSRAM exec window /
+ * PSRAM data heap; every other platform ignores the bit. */
 static void *
-loader_mmap(uint32 size, bool prot_exec, char *error_buf, uint32 error_buf_size)
+loader_mmap_xuansi(uint32 size, bool prot_exec, bool xuansi_psram,
+                   char *error_buf, uint32 error_buf_size)
 {
-    int map_prot =
-        MMAP_PROT_READ | MMAP_PROT_WRITE | (prot_exec ? MMAP_PROT_EXEC : 0);
+    int map_prot = MMAP_PROT_READ | MMAP_PROT_WRITE
+                   | (prot_exec ? MMAP_PROT_EXEC : 0)
+                   | (xuansi_psram ? MMAP_PROT_XUANSI_PSRAM : 0);
     int map_flags;
     void *mem;
 
@@ -335,6 +340,13 @@ loader_mmap(uint32 size, bool prot_exec, char *error_buf, uint32 error_buf_size)
         return NULL;
     }
     return mem;
+}
+
+static void *
+loader_mmap(uint32 size, bool prot_exec, char *error_buf, uint32 error_buf_size)
+{
+    return loader_mmap_xuansi(size, prot_exec, false, error_buf,
+                              error_buf_size);
 }
 
 static char *
@@ -554,6 +566,12 @@ load_target_info_section(const uint8 *buf, const uint8 *buf_end,
         set_error_buf(error_buf, error_buf_size, "invalid arch string");
         return false;
     }
+
+    /* XUANSI (P3-T10): does the CONTAINER target xtensa?  Drives the
+     * literal-layout discrimination rule (xtensa codegen always pools
+     * constants; other targets legitimately have no literal block). */
+    module->xuansi_is_xtensa =
+        (strncmp(target_info.arch, "xtensa", sizeof("xtensa") - 1) == 0);
 
     if (p != buf_end) {
         set_error_buf(error_buf, error_buf_size, "invalid section size");
@@ -929,11 +947,9 @@ load_custom_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
                 goto fail;
             break;
 #endif
-#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
         case AOT_CUSTOM_SECTION_RAW:
         {
             const char *section_name;
-            WASMCustomSection *section;
 
             if (p >= p_end) {
                 set_error_buf(error_buf, error_buf_size, "unexpected end");
@@ -942,23 +958,89 @@ load_custom_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
 
             read_string(p, p_end, section_name);
 
-            section = loader_malloc(sizeof(WASMCustomSection), error_buf,
-                                    error_buf_size);
-            if (!section) {
-                goto fail;
+            /* XUANSI (P3-T10): the surgery literal pool section.  Place
+             * the pool into its own non-executable allocation (PSRAM
+             * data heap on the board) instead of leaving it inside the
+             * text mapping; every relocation resolution path that uses
+             * module->literal (the .rela.literal group, symbols named
+             * ".literal") then lands on the placed pool automatically.
+             * Placement must happen before the RELOCATION section is
+             * processed (emit order guarantees it).  Handled before the
+             * generic raw-section bookkeeping and independent of
+             * WASM_ENABLE_LOAD_CUSTOM_SECTION (the pool is load-critical
+             * for surgery containers). */
+            if (!strcmp(section_name, XUANSI_LITERAL_SECTION_NAME)) {
+                uint32 content_len;
+                uint8 *pool;
+
+                if (module->xuansi_kind
+                    != (uint8)AOT_XUANSI_KIND_SURGERY) {
+                    /* a pool section in a container that did not
+                     * classify as surgery: emit-side invariant violated
+                     * (stock text embeds its literal block) */
+                    set_error_buf(error_buf, error_buf_size,
+                                  XUANSI_LITERAL_SECTION_NAME
+                                  " section in a non-surgery container");
+                    goto fail;
+                }
+                if (module->xuansi_literal_owned) {
+                    set_error_buf(error_buf, error_buf_size,
+                                  "duplicate " XUANSI_LITERAL_SECTION_NAME
+                                  " section");
+                    goto fail;
+                }
+
+                /* the emitter pads the name so the pool bytes start
+                 * 4-aligned inside the section (read_string consumed
+                 * the name INCLUDING its NUL; skip the pad).  When the
+                 * name ends exactly at the section end (empty pool) the
+                 * aligned pointer could pass p_end — clamp it. */
+                {
+                    const uint8 *pc = (const uint8 *)align_ptr(p, 4);
+                    if (pc > p_end) {
+                        pc = p_end;
+                    }
+                    p = pc;
+                }
+                content_len = (uint32)(p_end - p);
+
+                pool = (uint8 *)loader_mmap_xuansi(
+                    content_len > 0 ? content_len : 4, false, true, error_buf,
+                    error_buf_size);
+                if (!pool) {
+                    goto fail;
+                }
+                bh_memcpy_s(pool, content_len, p, content_len);
+                module->literal = pool;
+                module->literal_size = content_len;
+                module->xuansi_literal_owned = 1;
+                LOG_VERBOSE("xuansi: literal pool placed, %u bytes",
+                            content_len);
+                break;
             }
 
-            section->name_addr = (char *)section_name;
-            section->name_len = (uint32)strlen(section_name);
-            section->content_addr = (uint8 *)p;
-            section->content_len = (uint32)(p_end - p);
+#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+            {
+                WASMCustomSection *section =
+                    loader_malloc(sizeof(WASMCustomSection), error_buf,
+                                  error_buf_size);
+                if (!section) {
+                    goto fail;
+                }
 
-            section->next = module->custom_section_list;
-            module->custom_section_list = section;
-            LOG_VERBOSE("Load custom section [%s] success.", section_name);
+                section->name_addr = (char *)section_name;
+                section->name_len = (uint32)strlen(section_name);
+                section->content_addr = (uint8 *)p;
+                section->content_len = (uint32)(p_end - p);
+
+                section->next = module->custom_section_list;
+                module->custom_section_list = section;
+                LOG_VERBOSE("Load custom section [%s] success.",
+                            section_name);
+            }
+#endif /* end of WASM_ENABLE_LOAD_CUSTOM_SECTION != 0 */
             break;
         }
-#endif /* end of WASM_ENABLE_LOAD_CUSTOM_SECTION != 0 */
         default:
             break;
     }
@@ -2732,8 +2814,18 @@ load_text_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
     /* The layout is: literal size + literal + code (with plt table) */
     read_uint32(buf, buf_end, module->literal_size);
 
-    /* literal data is at beginning of the text section */
-    module->literal = (uint8 *)buf;
+    /* literal data is at beginning of the text section.
+     * XUANSI (P3-T10): in a surgery container the literal bytes travel
+     * in the xuansi.literal CUSTOM section and are placed into their
+     * own allocation by load_custom_section — keep literal NULL here
+     * (the discrimination invariants key on literal == NULL meaning
+     * "no pool yet").  Stock containers with literal_size == 0 (e.g.
+     * host targets whose codegen has no literal pool) keep the stock
+     * behavior of pointing literal at the text start. */
+    if (module->literal_size > 0
+        || module->xuansi_kind != (uint8)AOT_XUANSI_KIND_SURGERY) {
+        module->literal = (uint8 *)buf;
+    }
     module->code = (void *)(buf + module->literal_size);
     module->code_size = (uint32)(buf_end - (uint8 *)module->code);
 
@@ -3923,10 +4015,24 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
 
     if (module->code) {
         /* The layout is: literal size + literal + code (with plt table) */
-        uint8 *mmap_addr = module->literal - sizeof(uint32);
-        uint32 total_size =
-            sizeof(uint32) + module->literal_size + module->code_size;
-        os_mprotect(mmap_addr, total_size, map_prot);
+        if (module->xuansi_literal_owned) {
+            /* XUANSI (P3-T10): surgery layout — the text mapping holds
+             * only [literal_size field == 0][code (+plt)]; the pool is
+             * a separate data allocation.  Text bounds derive from
+             * code, and the pool drops to read-only data. */
+            os_mprotect((uint8 *)module->code - sizeof(uint32),
+                        sizeof(uint32) + module->code_size, map_prot);
+            if (module->literal) {
+                os_mprotect(module->literal, module->literal_size,
+                            MMAP_PROT_READ);
+            }
+        }
+        else {
+            uint8 *mmap_addr = module->literal - sizeof(uint32);
+            uint32 total_size =
+                sizeof(uint32) + module->literal_size + module->code_size;
+            os_mprotect(mmap_addr, total_size, map_prot);
+        }
     }
 
     map_prot = MMAP_PROT_READ;
@@ -3992,6 +4098,15 @@ load_from_sections(AOTModule *module, AOTSection *sections,
     AOTSection *section = sections;
     const uint8 *buf, *buf_end;
     uint32 last_section_type = (uint32)-1, section_type;
+    /* XUANSI (P3-T10): last NUMBERED section type.  CUSTOM sections may
+     * now appear anywhere (they do not advance this cursor), so surgery
+     * containers can carry xuansi.literal between EXPORT and RELOCATION
+     * — the pool is placed before relocations apply.  Stock containers
+     * (customs only at the tail) accept exactly as before.  An older
+     * runtime without this relaxation rejects the new order ("invalid
+     * section order") — the designed honest refusal that keeps old fw
+     * from ever running surgery products. */
+    uint32 last_numbered_type = (uint32)-1;
     uint32 i, func_index, func_type_index;
     AOTFuncType *func_type;
     AOTExport *exports;
@@ -4002,13 +4117,24 @@ load_from_sections(AOTModule *module, AOTSection *sections,
         buf_end = buf + section->section_body_size;
         /* Check sections */
         section_type = (uint32)section->section_type;
-        if ((last_section_type == (uint32)-1
-             && section_type != AOT_SECTION_TYPE_TARGET_INFO)
-            || (last_section_type != (uint32)-1
-                && (section_type != last_section_type + 1
-                    && section_type != AOT_SECTION_TYPE_CUSTOM))) {
-            set_error_buf(error_buf, error_buf_size, "invalid section order");
-            return false;
+        if (section_type == AOT_SECTION_TYPE_CUSTOM) {
+            /* allowed anywhere after the first numbered section */
+            if (last_numbered_type == (uint32)-1) {
+                set_error_buf(error_buf, error_buf_size,
+                              "invalid section order");
+                return false;
+            }
+        }
+        else {
+            if ((last_numbered_type == (uint32)-1
+                 && section_type != AOT_SECTION_TYPE_TARGET_INFO)
+                || (last_numbered_type != (uint32)-1
+                    && section_type != last_numbered_type + 1)) {
+                set_error_buf(error_buf, error_buf_size,
+                              "invalid section order");
+                return false;
+            }
+            last_numbered_type = section_type;
         }
         last_section_type = section_type;
         switch (section_type) {
@@ -4074,6 +4200,20 @@ load_from_sections(AOTModule *module, AOTSection *sections,
     if (last_section_type != AOT_SECTION_TYPE_RELOCATION
         && last_section_type != AOT_SECTION_TYPE_CUSTOM) {
         set_error_buf(error_buf, error_buf_size, "section missing");
+        return false;
+    }
+
+    /* XUANSI (P3-T10): enforce the discrimination table at load time for
+     * every entry path (file buffer and pre-built section lists): an
+     * xtensa container with literal_size == 0 and no placed pool is
+     * malformed — there is no valid shape left (stock embeds the block,
+     * surgery carries the section).  Reject honestly; never guess. */
+    if (module->xuansi_is_xtensa && module->literal_size == 0
+        && !module->xuansi_literal_owned) {
+        set_error_buf(error_buf, error_buf_size,
+                      "malformed xuansi AOT container: xtensa text with "
+                      "literal_size == 0 and no " XUANSI_LITERAL_SECTION_NAME
+                      " section");
         return false;
     }
 
@@ -4367,9 +4507,14 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                         (uint64)section_size + aot_get_plt_table_size();
                     total_size = (total_size + 3) & ~((uint64)3);
                     if (total_size >= UINT32_MAX
-                        || !(aot_text =
-                                 loader_mmap((uint32)total_size, true,
-                                             error_buf, error_buf_size))) {
+                        || !(aot_text = loader_mmap_xuansi(
+                                 (uint32)total_size, true,
+                                 /* XUANSI (P3-T10): surgery text goes to
+                                  * the PSRAM exec window (patch #3);
+                                  * stock keeps the A1 path bit-identical */
+                                 module->xuansi_kind
+                                     == (uint8)AOT_XUANSI_KIND_SURGERY,
+                                 error_buf, error_buf_size))) {
                         wasm_runtime_free(section);
                         goto fail;
                     }
@@ -4446,6 +4591,187 @@ aot_compatible_version(uint32 version)
     return version == 4 || version == 3;
 }
 
+/*
+ * XUANSI (P3-T10): container-kind classifier (spec 5.3.3 table).
+ *
+ * Pure section-header walk over the raw buffer: no allocation, no
+ * target dependency, no side effects.  The fw load gate (T11) consumes
+ * this before choosing a placement path, and load() consumes it before
+ * create_sections() to route the text mmap.
+ *
+ *   literal_size > 0                            -> STOCK
+ *   literal_size == 0 && xuansi.literal present  -> SURGERY
+ *   literal_size == 0 && no pool section:
+ *     xtensa container   -> MALFORMED (xtensa codegen always pools)
+ *     other targets      -> STOCK (their codegen has no literal pool)
+ *   bad magic/version, truncated walk, no TEXT
+ *                                              -> MALFORMED
+ */
+static bool
+xuansi_classify(const uint8 *buf, uint32 size, bool *p_is_xtensa,
+                uint32 *p_literal_size, bool *p_has_pool,
+                uint32 *p_pool_section_size)
+{
+    const uint8 *p = buf, *p_end = buf + size;
+    uint32 magic, version, section_type, section_size;
+    bool saw_text = false;
+
+    *p_is_xtensa = false;
+    *p_literal_size = (uint32)-1;
+    *p_has_pool = false;
+    *p_pool_section_size = 0;
+
+    if (size < 8) {
+        return false;
+    }
+    magic = (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16)
+            | ((uint32)p[3] << 24);
+    if (magic != AOT_MAGIC_NUMBER) {
+        return false;
+    }
+    version = (uint32)p[4] | ((uint32)p[5] << 8) | ((uint32)p[6] << 16)
+              | ((uint32)p[7] << 24);
+    if (!aot_compatible_version(version)) {
+        return false;
+    }
+    p += 8;
+
+    while (p < p_end) {
+        const uint8 *body;
+        /* section headers are 4-aligned (the emitter aligns each section
+         * start; the stock reader's TEMPLATE_READ aligns likewise) */
+        p = (const uint8 *)(((uintptr_t)p + 3) & ~(uintptr_t)3);
+        if (p + 8 > p_end) {
+            return false;
+        }
+        section_type = (uint32)p[0] | ((uint32)p[1] << 8)
+                       | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+        section_size = (uint32)p[4] | ((uint32)p[5] << 8)
+                       | ((uint32)p[6] << 16) | ((uint32)p[7] << 24);
+        p += 8;
+        if ((uint64)(p_end - p) < section_size) {
+            return false;
+        }
+        body = p;
+
+        if (section_type == AOT_SECTION_TYPE_TARGET_INFO) {
+            /* AOTTargetInfo: ... e_machine(e_flags at 28..36), arch at 32
+             * (2+2+2+2+4+4+8+8 = 32 bytes of fixed fields first) */
+            static const char xtensa_prefix[] = "xtensa";
+            const uint8 *arch;
+            if (section_size < 32 + 2) {
+                return false;
+            }
+            arch = body + 32;
+            if ((uint32)(p_end - arch) >= sizeof(xtensa_prefix)
+                && !memcmp(arch, xtensa_prefix, sizeof(xtensa_prefix) - 1)) {
+                *p_is_xtensa = true;
+            }
+        }
+        else if (section_type == AOT_SECTION_TYPE_TEXT) {
+            if (section_size < 4) {
+                return false;
+            }
+            if (saw_text) {
+                return false; /* duplicate text section */
+            }
+            saw_text = true;
+            *p_literal_size = (uint32)body[0] | ((uint32)body[1] << 8)
+                              | ((uint32)body[2] << 16)
+                              | ((uint32)body[3] << 24);
+            if (*p_literal_size > section_size - 4) {
+                return false; /* literal block larger than the section */
+            }
+        }
+        else if (section_type == AOT_SECTION_TYPE_CUSTOM) {
+            /* CUSTOM body: u32 sub type; RAW: u16 len + name + content */
+            uint32 sub_type;
+            if (section_size < 4) {
+                return false;
+            }
+            sub_type = (uint32)body[0] | ((uint32)body[1] << 8)
+                       | ((uint32)body[2] << 16) | ((uint32)body[3] << 24);
+            if (sub_type == AOT_CUSTOM_SECTION_RAW) {
+                const uint8 *q = body + 4;
+                uint32 name_len;
+                if ((uint64)(p_end - q) < 2) {
+                    return false;
+                }
+                name_len = (uint32)q[0] | ((uint32)q[1] << 8);
+                q += 2;
+                if ((uint64)(p_end - q) < name_len) {
+                    return false;
+                }
+                /* EMIT_STR convention: the u16 length counts the
+                 * terminating NUL; the name must be NUL-terminated */
+                if (name_len == strlen(XUANSI_LITERAL_SECTION_NAME) + 1
+                    && q[name_len - 1] == '\0'
+                    && !memcmp(q, XUANSI_LITERAL_SECTION_NAME,
+                               name_len - 1)) {
+                    if (*p_has_pool) {
+                        return false; /* duplicate pool section */
+                    }
+                    *p_has_pool = true;
+                    q += name_len;
+                    /* the emitter pads the name so the pool bytes start
+                     * 4-aligned inside the section (the section body
+                     * start is 4-aligned in the file) */
+                    q = (const uint8 *)(((uintptr_t)q + 3)
+                                        & ~(uintptr_t)3);
+                    if (q > body + section_size) {
+                        q = body + section_size; /* empty pool */
+                    }
+                    *p_pool_section_size =
+                        (uint32)(body + section_size - q);
+                }
+            }
+        }
+
+        p += section_size;
+    }
+
+    return saw_text;
+}
+
+AOTXuansiKind
+aot_xuansi_kind(const uint8 *buf, uint32 size)
+{
+    bool is_xtensa, has_pool;
+    uint32 literal_size, pool_section_size;
+
+    if (!xuansi_classify(buf, size, &is_xtensa, &literal_size, &has_pool,
+                         &pool_section_size)) {
+        return AOT_XUANSI_KIND_MALFORMED;
+    }
+    if (literal_size > 0) {
+        return has_pool ? AOT_XUANSI_KIND_MALFORMED /* both shapes at once:
+                                                       emit-side invariant
+                                                       violation */
+                        : AOT_XUANSI_KIND_STOCK;
+    }
+    return has_pool ? AOT_XUANSI_KIND_SURGERY
+                    : (is_xtensa ? AOT_XUANSI_KIND_MALFORMED
+                                 : AOT_XUANSI_KIND_STOCK);
+}
+
+static bool
+xuansi_reject_kind(AOTXuansiKind kind, char *error_buf, uint32 error_buf_size)
+{
+    switch (kind) {
+        case AOT_XUANSI_KIND_STOCK:
+        case AOT_XUANSI_KIND_SURGERY:
+            return true;
+        case AOT_XUANSI_KIND_MALFORMED:
+        default:
+            set_error_buf(error_buf, error_buf_size,
+                          "malformed xuansi AOT container: text "
+                          "literal_size == 0 without the "
+                          XUANSI_LITERAL_SECTION_NAME
+                          " section (or bad magic/version/truncated)");
+            return false;
+    }
+}
+
 static bool
 load(const uint8 *buf, uint32 size, AOTModule *module,
      bool wasm_binary_freeable, bool no_resolve, char *error_buf,
@@ -4471,9 +4797,23 @@ load(const uint8 *buf, uint32 size, AOTModule *module,
 
     module->package_version = version;
 
+    /* XUANSI (P3-T10): classify the container by section structure BEFORE
+     * any allocation, so the text mmap can be routed (SURGERY -> PSRAM
+     * exec window via MMAP_PROT_XUANSI_PSRAM; STOCK -> the A1 internal
+     * SRAM path, bit-identical to the pre-T10 behavior) and malformed
+     * shapes are rejected honestly before any placement. */
+    {
+        AOTXuansiKind kind = aot_xuansi_kind(buf, size);
+        if (!xuansi_reject_kind(kind, error_buf, error_buf_size)) {
+            return false;
+        }
+        module->xuansi_kind = (uint8)kind;
+    }
+
     if (!create_sections(module, buf, size, &section_list, error_buf,
-                         error_buf_size))
+                         error_buf_size)) {
         return false;
+    }
 
     ret = load_from_sections(module, section_list, !wasm_binary_freeable,
                              no_resolve, error_buf, error_buf_size);
@@ -4644,10 +4984,35 @@ aot_unload(AOTModule *module)
     if (module->code && !module->is_indirect_mode
         && !module->merged_data_text_sections) {
         /* The layout is: literal size + literal + code (with plt table) */
-        uint8 *mmap_addr = module->literal - sizeof(uint32);
-        uint32 total_size =
-            sizeof(uint32) + module->literal_size + module->code_size;
-        os_munmap(mmap_addr, total_size);
+        if (module->xuansi_literal_owned) {
+            /* XUANSI (P3-T10): surgery layout — text mapping is
+             * [literal_size field == 0][code (+plt)]; the pool is a
+             * separate allocation owned by this module (PSRAM data heap
+             * on the board).  Free both, pool first. */
+            if (module->literal) {
+                os_munmap(module->literal,
+                          module->literal_size > 0 ? module->literal_size
+                                                   : 4);
+                module->literal = NULL;
+                module->literal_size = 0;
+            }
+            os_munmap((uint8 *)module->code - sizeof(uint32),
+                      sizeof(uint32) + module->code_size);
+        }
+        else {
+            uint8 *mmap_addr = module->literal - sizeof(uint32);
+            uint32 total_size =
+                sizeof(uint32) + module->literal_size + module->code_size;
+            os_munmap(mmap_addr, total_size);
+        }
+    }
+    else if (module->xuansi_literal_owned && module->literal) {
+        /* load failed before the text was placed (or indirect mode):
+         * the pool is still owned and must not leak */
+        os_munmap(module->literal,
+                  module->literal_size > 0 ? module->literal_size : 4);
+        module->literal = NULL;
+        module->literal_size = 0;
     }
 
 #if defined(BH_PLATFORM_WINDOWS)

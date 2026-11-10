@@ -357,8 +357,10 @@ xuansi_sync_exec_region(const void *ptr, size_t len)
  * IRAM reserved region above (single occupancy). This PSRAM mapper is
  * the placement machinery the A3 surgery-version dispatch (T10/T11)
  * revives; keep it compiled (marked unused until then) so the revival
- * is a routing change, not a resurrection from history. */
-__attribute__((unused))
+ * is a routing change, not a resurrection from history.
+ * P3-T10: revived — os_mmap(EXEC | MMAP_PROT_XUANSI_PSRAM) (surgery
+ * containers only, routed by the loader's container-kind dispatch)
+ * lands here. Stock containers never set the bit. */
 static void *xuansi_mmap_exec(size_t size)
 {
     size_t map_size =
@@ -442,9 +444,26 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     /* XUANSI: EXEC＝A1 內部 SRAM 保留區（P3-T6，單佔用槽；見上方注記）；
      * PSRAM esp_mmu_map 路（修補 #3）停等 A3 手術版派送（T10/T11）。
-     * 非 EXEC 照舊 8BIT 對齊配置。 */
+     * 非 EXEC 照舊 8BIT 對齊配置。
+     * P3-T10: MMAP_PROT_XUANSI_PSRAM 復活 #3 映射器——手術版容器
+     * （判別＝SURGERY）的 text 走 PSRAM 執行窗；stock 容器不帶此位，
+     * 保留區路徑位元級不變。 */
     if (prot & MMAP_PROT_EXEC) {
+        if (prot & MMAP_PROT_XUANSI_PSRAM) {
+            return xuansi_mmap_exec(size);
+        }
         return xuansi_mmap_exec_region(size);
+    }
+    if (prot & MMAP_PROT_XUANSI_PSRAM) {
+        /* XUANSI (P3-T10): 手術版 literal 池＝純資料，PSRAM 一般資料堆
+         * （heap_caps SPIRAM；主人裁定 2026-11-10）。池不經 esp_mmu_map
+         * ——資料讀取走 D 窗本就安全。分配歸零（修補 #8 紀律）。 */
+        void *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            return NULL;
+        }
+        memset(buf, 0, size);
+        return buf;
     }
     void *buf_origin_8 =
         heap_caps_malloc(size + 4 + sizeof(uintptr_t), MALLOC_CAP_8BIT);

@@ -241,6 +241,24 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
             uint8 *insn_addr = target_section_addr + reloc_offset;
             /* Currently only l32r instruction generates R_XTENSA_SLOT0_OP
              * relocation */
+
+            /* XUANSI (P3-T10): surgery containers are emitted with zero
+             * l32r (the codegen routes every pool reference through the
+             * instance literal-base slot).  A SLOT0_OP relocation in a
+             * container classified as surgery means the toolchain
+             * pairing broke (surgery container shape around stock
+             * codegen): the PC-relative fixup below assumes the pool
+             * lives inside the text mapping, which is exactly what the
+             * surgery layout removed.  Fail loud instead of patching
+             * garbage. */
+            if (module->xuansi_kind == (uint8)AOT_XUANSI_KIND_SURGERY) {
+                set_error_buf(error_buf, error_buf_size,
+                              "AOT module load failed: R_XTENSA_SLOT0_OP "
+                              "relocation in a surgery container "
+                              "(toolchain pairing mismatch).");
+                return false;
+            }
+
             l32r_insn_t *l32r_insn = (l32r_insn_t *)insn_addr;
             uint8 *reloc_addr;
             int32 relative_offset /*, initial_addend */;

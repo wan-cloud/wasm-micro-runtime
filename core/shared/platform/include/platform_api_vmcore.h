@@ -122,7 +122,15 @@ enum {
     MMAP_PROT_NONE = 0,
     MMAP_PROT_READ = 1,
     MMAP_PROT_WRITE = 2,
-    MMAP_PROT_EXEC = 4
+    MMAP_PROT_EXEC = 4,
+    /* XUANSI fork (P3-T10): placement hint for the esp-idf S3 platform.
+     * With MMAP_PROT_EXEC it routes os_mmap to the PSRAM exec window
+     * (esp_mmu_map, fork patch #3 machinery) instead of the internal
+     * SRAM reserve (patch #12); without EXEC it asks for a plain
+     * PSRAM data-heap allocation (heap_caps_malloc(SPIRAM)) for the
+     * surgery literal pool.  Every other platform ignores the bit
+     * (they translate prot to their own flags one by one). */
+    MMAP_PROT_XUANSI_PSRAM = 8
 };
 
 /* Memory map flags */
