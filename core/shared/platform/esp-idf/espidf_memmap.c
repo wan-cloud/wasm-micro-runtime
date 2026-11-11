@@ -99,293 +99,13 @@ static xuansi_exec_map_t *xuansi_map_find_by_dbus(void *ptr)
     return NULL;
 }
 
-/* XUANSI VENDORED PATCH #16 (2026-11-11) — the internal-SRAM AOT lane
- * (patches #12/#13) is compile-time optional, default OFF.
- *
- * The consumer's fw 0.4.0 retires the internal lane: every .aot rides
- * the PSRAM exec window (the surgery path), so the static IRAM reserve
- * (#12: 24 KB of .iram1 + single-occupancy slot + munmap third branch)
- * and the PMS write-protection survival layers (#13: the write probe,
- * xuansi_aot_exec_writable() and the per-boot unroute guard) are dead
- * weight on that product. Gate them behind XUANSI_AOT_IRAM_LANE (CMake
- * option in shared_platform.cmake, default OFF; ON restores the
- * pre-#16 state bit-identically).
- *
- * OFF means: no reserve is placed, xuansi_aot_exec_budget() /
- * xuansi_aot_exec_writable() are not exported, the #13 probe and the
- * per-boot PMS unroute guard are not compiled, and os_mmap(EXEC)
- * without MMAP_PROT_XUANSI_PSRAM refuses honestly (NULL) — there is no
- * internal placement anymore. The SURGERY face is NOT gated and stays
- * byte-for-byte: the patch #3 PSRAM exec window, the patch #15 pool
- * registry / os_munmap fourth branch and the loader's aot_xuansi_kind()
- * dispatch are the only lane fw 0.4.0 uses. */
-#ifndef XUANSI_AOT_IRAM_LANE
-#define XUANSI_AOT_IRAM_LANE 0
-#endif
-
-#if XUANSI_AOT_IRAM_LANE
-/* XUANSI (P3-T6, 2026-11-10): A1 internal-SRAM AOT text placement.
- *
- * Board measurement (P3-T5, canonical load states) proved the
- * EXEC|INTERNAL heap is structurally 0 B on this app's sdkconfig - every
- * internal heap region carries DRAM caps only - so a
- * heap_caps_malloc(EXEC) placement can never succeed. The A1 placement is
- * a static IRAM reserved region instead:
- *   - one .iram1 carve-out (inside .iram0.text, size tunable via
- *     XUANSI_AOT_EXEC_RESERVE_BYTES; 24 KB default covers every stock
- *     .aot text measured so far, the largest being st7789 at 20,684 B);
- *   - single occupancy: one module's text at a time (co-residency waits
- *     for the A3 PSRAM placement), os_mmap(EXEC) refuses when occupied;
- *   - zero-on-alloc (same discipline as patch #8: never hand out stale
- *     bytes from a previously unloaded module);
- *   - the region pointer is the plain IRAM address: readable, writable
- *     and executable through the same address (internal SRAM is
- *     single-alias and uncached on S3, so the loader's data writes and
- *     the I-fetches cohere without any bus translation).
- * SECTION CHOICE IS LOAD-BEARING (first board attempt): the S3 memory
- * protection (CONFIG_ESP_SYSTEM_MEMPROT_FEATURE, locked after boot)
- * splits IRAM at _iram_text_end - .iram0.text and below = R+X, while
- * .iram0.data/.iram0.bss above the split = R+W with NO execute. A
- * .iram.bss reserve executes into an int-wdt wedge on the first fetch;
- * the reserve must live inside the executable span, hence .iram1
- * (collected into .iram0.text). PROGBITS cost: the reserve occupies the
- * flash image (~24 KB of zeros copied at boot) - accepted, the app
- * partition has headroom.
- * Stock .aot never goes to the PSRAM exec path (patch #3 machinery) in
- * A1: the container-gate dispatch lands with the A3 surgery-version
- * modules (T10/T11). */
-#ifndef XUANSI_AOT_EXEC_RESERVE_BYTES
-#define XUANSI_AOT_EXEC_RESERVE_BYTES (24 * 1024)
-#endif
-
-static uint8_t s_xuansi_aot_exec[XUANSI_AOT_EXEC_RESERVE_BYTES]
-    __attribute__((section(".iram1"), aligned(16)));
-static uint8_t s_xuansi_aot_exec_used;
-
-/* XUANSI VENDORED PATCH #13 (P3-T6w, 2026-11-10) — survive PMS
- * write-protection of the IRAM0 text span.
- *
- * The reserve lives in .iram1 (inside .iram0.text, below _iram_text_end)
- * because that is the only internal-SRAM span the S3 memory protection
- * leaves executable. Whenever the restrictive PMS configuration is active
- * that span is also WRITE-DENIED (W^X). The loader writing the reserve
- * then raises an IRAM0 PMS violation whose interrupt source is routed to
- * ETS_MEMACCESS_ERR_INUM - the SAME inum as the cache-error sources - so
- * xt_highint4 classifies it as PANIC_RSN_CACHEERR. A PMS violation leaves
- * the cache access-error statuses empty, esp_cache_err_acs_save_and_clr()
- * returns -1, and the panic arbitration parks this core (APP) in
- * busy_wait() at INTLEVEL 5 waiting for a core that never panics: a
- * whole-board freeze, int-wdt reboot on release builds. (Board evidence
- * 2026-11-10: CORE_1_IRAM0_PMS_MONITOR_2 = {VIOLATE_INTR, WR, LOADSTORE,
- * ADDR 0x4037bf50 = the reserve base}; the store itself is CANCELLED -
- * pattern readback read zero.)
- * Two layers keep the board alive and the failure honest:
- *   (a) write-probe the requested span up front (a write-denied store
- *       silently cancels) - refuse the mapping, no interrupt ever fires;
- *   (b) across the whole load window, unroute the four per-core PMS
- *       violation sources (to the invalid inum) and clear latched
- *       violations on exit, so a mid-load state flip degrades to a
- *       corrupt-text load failure instead of the panic-path deadlock.
- * The enforcement state varies across boots ("wedge phases" vs "green
- * phases", hours-scale, root not identified - it is not any fw/fork
- * code); the probe makes both phases safe and reports which one is live. */
-#include "soc/interrupts.h"
-#include "soc/sensitive_reg.h"
-
-static uint8_t s_xuansi_pms_guard_depth;
-static uint8_t s_xuansi_pms_unrouted;
-
-/* Unroute the four per-core PMS violation sources to the invalid inum.
- * Once per boot (the unrouted state is kept for the whole boot: a latched
- * violation keeps its line asserted, and re-arming the routing while hot
- * would deliver the very interrupt we are defending against; a board
- * session with the sources unrouted was verified stable - the stores
- * stay DENIED either way, only the (broken) panic reporting is muted). */
-static void
-xuansi_pms_unroute_once(void)
-{
-    extern void esp_rom_route_intr_matrix(int cpu_core,
-                                          uint32_t periph_intr_id,
-                                          uint32_t cpu_intr_num);
-    if (s_xuansi_pms_unrouted) {
-        return;
-    }
-    s_xuansi_pms_unrouted = 1;
-    esp_rom_route_intr_matrix(1, ETS_CORE1_IRAM0_PMS_INTR_SOURCE,
-                              ETS_INVALID_INUM);
-    esp_rom_route_intr_matrix(1, ETS_CORE1_DRAM0_PMS_INTR_SOURCE,
-                              ETS_INVALID_INUM);
-    esp_rom_route_intr_matrix(0, ETS_CORE0_IRAM0_PMS_INTR_SOURCE,
-                              ETS_INVALID_INUM);
-    esp_rom_route_intr_matrix(0, ETS_CORE0_DRAM0_PMS_INTR_SOURCE,
-                              ETS_INVALID_INUM);
-}
-
-static void
-xuansi_pms_guard_enter(void)
-{
-    if (s_xuansi_pms_guard_depth++ != 0) {
-        return;
-    }
-    xuansi_pms_unroute_once();
-}
-
-/* Close the window: swallow anything latched (write-1-to-clear). The
- * routing stays unrouted for the rest of the boot (see unroute_once). */
-static void
-xuansi_pms_guard_exit(void)
-{
-    if (s_xuansi_pms_guard_depth == 0 || --s_xuansi_pms_guard_depth != 0) {
-        return;
-    }
-    REG_SET_BIT(SENSITIVE_CORE_0_IRAM0_PMS_MONITOR_1_REG,
-                SENSITIVE_CORE_0_IRAM0_PMS_MONITOR_VIOLATE_CLR);
-    REG_SET_BIT(SENSITIVE_CORE_1_IRAM0_PMS_MONITOR_1_REG,
-                SENSITIVE_CORE_1_IRAM0_PMS_MONITOR_VIOLATE_CLR);
-    REG_SET_BIT(SENSITIVE_CORE_0_DRAM0_PMS_MONITOR_1_REG,
-                SENSITIVE_CORE_0_DRAM0_PMS_MONITOR_VIOLATE_CLR);
-    REG_SET_BIT(SENSITIVE_CORE_1_DRAM0_PMS_MONITOR_1_REG,
-                SENSITIVE_CORE_1_DRAM0_PMS_MONITOR_VIOLATE_CLR);
-}
-
-/* Pattern-write/readback probe over the first/last words of the span
- * (permission granularity is the PMS slot/category, far coarser than the
- * span, so two words cover it). Returns 1 when the stores land. */
-static int
-xuansi_region_writable(size_t size)
-{
-    volatile uint32_t *b = (volatile uint32_t *)(void *)s_xuansi_aot_exec;
-    size_t words = size / sizeof(uint32_t);
-    if (words == 0) {
-        words = 1;
-    }
-    uint32_t f = b[0], l = b[words - 1];
-    b[0] = 0xA5A5F00Fu;
-    b[words - 1] = 0x0F5AA5A5u;
-    int ok = (b[0] == 0xA5A5F00Fu) && (b[words - 1] == 0x0F5AA5A5u);
-    b[0] = f;
-    b[words - 1] = l;
-    return ok;
-}
-
-/* Single source for the fw-side budget gate and the caps advertisement
- * (aot_exec_budget_bytes): the fw must not hand-copy the reserve size. */
-uint32_t
-xuansi_aot_exec_budget(void)
-{
-    return (uint32_t)XUANSI_AOT_EXEC_RESERVE_BYTES;
-}
-
-/* Single source for the fw-side pre-gate (patch #13): probe whether the
- * reserve span is writable this boot, without disturbing resident text
- * (a resident module implies the probe passed for it; do not touch it). */
-int
-xuansi_aot_exec_writable(uint32_t size)
-{
-    if (size == 0 || size > XUANSI_AOT_EXEC_RESERVE_BYTES) {
-        return 0;
-    }
-    if (s_xuansi_aot_exec_used) {
-        return 1;
-    }
-    xuansi_pms_guard_enter();
-    int ok = xuansi_region_writable(size);
-    xuansi_pms_guard_exit();
-    return ok;
-}
-
-static int
-xuansi_ptr_in_aot_exec(const void *ptr)
-{
-    return (const uint8_t *)ptr >= s_xuansi_aot_exec
-           && (const uint8_t *)ptr
-                  < s_xuansi_aot_exec + XUANSI_AOT_EXEC_RESERVE_BYTES;
-}
-
-static void *
-xuansi_mmap_exec_region(size_t size)
-{
-    if (size == 0 || size > XUANSI_AOT_EXEC_RESERVE_BYTES) {
-        return NULL;
-    }
-    if (s_xuansi_aot_exec_used) {
-        return NULL;   /* single-occupancy slot is taken (unload first) */
-    }
-    /* patch #13: guard first (the probe's own denied write would raise
-     * the very interrupt we are defending against), then probe, then
-     * zero-on-alloc. Probe failure closes the guard before returning. */
-    xuansi_pms_guard_enter();
-    if (!xuansi_region_writable(size)) {
-        xuansi_pms_guard_exit();
-        return NULL;   /* PMS write-denies the span this boot */
-    }
-    s_xuansi_aot_exec_used = 1;
-    memset(s_xuansi_aot_exec, 0, size);
-    return s_xuansi_aot_exec;
-}
-
-/* Third munmap branch (P3-T6): settle pointers inside the reserved region
- * by releasing the slot - NEVER by the generic free()/esp_mmu_unmap
- * paths below (the region is static storage). Range match on purpose:
- * the loader may hand an interior pointer (module->literal - 4 etc.),
- * any pointer within [base, base + size) releases the one slot (this
- * also closes the T4-review note about exact-match munmap semantics). */
-static int
-xuansi_munmap_exec_region(void *ptr)
-{
-    if (!xuansi_ptr_in_aot_exec(ptr)) {
-        return 0;
-    }
-    s_xuansi_aot_exec_used = 0;
-    xuansi_pms_guard_exit();   /* patch #13: close the write window */
-    return 1;
-}
-
-/* Text-sync for the reserved region (P3-T6 ruling): one esp_cache_msync
- * M2C|INST over the line-rounded range clamped to the region, on the
- * direct pointer - internal SRAM has no dual-bus alias and is uncached
- * on S3, so this is defensive (same helper shape as xuansi_msync_pair,
- * which needs the two aliases only for PSRAM mappings). */
-static void
-xuansi_sync_exec_region(const void *ptr, size_t len)
-{
-    uint32_t dline = Cache_Get_DCache_Line_Size();
-    uint32_t iline = Cache_Get_ICache_Line_Size();
-    uint32_t line = (dline > iline) ? dline : iline;
-    uint32_t off, start, end;
-
-    if (line == 0) {
-        line = 32;
-    }
-    off = (uint32_t)((const uint8_t *)ptr - s_xuansi_aot_exec);
-    if (off >= XUANSI_AOT_EXEC_RESERVE_BYTES || len == 0) {
-        return;
-    }
-    if (len > XUANSI_AOT_EXEC_RESERVE_BYTES - off) {
-        len = XUANSI_AOT_EXEC_RESERVE_BYTES - off;
-    }
-    start = off & ~(line - 1);
-    end = (off + (uint32_t)len + line - 1) & ~(line - 1);
-    if (end > XUANSI_AOT_EXEC_RESERVE_BYTES) {
-        end = XUANSI_AOT_EXEC_RESERVE_BYTES;
-    }
-    if (end <= start) {
-        return;
-    }
-    esp_cache_msync(s_xuansi_aot_exec + start, end - start,
-                    ESP_CACHE_MSYNC_FLAG_DIR_M2C
-                        | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
-}
-#endif /* XUANSI_AOT_IRAM_LANE (patch #16: the #12/#13 machinery above) */
 
 
-/* XUANSI (P3-T6): parked for A3 — os_mmap(EXEC) now serves the internal
- * IRAM reserved region above (single occupancy). This PSRAM mapper is
- * the placement machinery the A3 surgery-version dispatch (T10/T11)
- * revives; keep it compiled (marked unused until then) so the revival
- * is a routing change, not a resurrection from history.
- * P3-T10: revived — os_mmap(EXEC | MMAP_PROT_XUANSI_PSRAM) (surgery
- * containers only, routed by the loader's container-kind dispatch)
+/* XUANSI (P3-T6 → #17): the PSRAM exec mapper — since patch #17 removed
+ * the internal-SRAM reserved region (the IRAM lane, retired with the
+ * 0.4.0 all-PSRAM ruling) this is the ONLY executable placement:
+ * os_mmap(EXEC | MMAP_PROT_XUANSI_PSRAM), routed by the loader's
+ * container-kind dispatch (P3-T10 revival), lands here.
  * lands here. Stock containers never set the bit. */
 static void *xuansi_mmap_exec(size_t size)
 {
@@ -531,26 +251,20 @@ void *
 os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-    /* XUANSI: EXEC＝A1 內部 SRAM 保留區（P3-T6，單佔用槽；見上方注記）；
-     * PSRAM esp_mmu_map 路（修補 #3）停等 A3 手術版派送（T10/T11）。
-     * 非 EXEC 照舊 8BIT 對齊配置。
-     * P3-T10: MMAP_PROT_XUANSI_PSRAM 復活 #3 映射器——手術版容器
-     * （判別＝SURGERY）的 text 走 PSRAM 執行窗；stock 容器不帶此位，
-     * 保留區路徑位元級不變。 */
+    /* XUANSI: EXEC 僅手術版 PSRAM 執行窗（修補 #3 映射器，P3-T10 復活）；
+     * 內部 SRAM 保留區（P3-T6）已隨修補 #17 全刪（0.4.0 全走 PSRAM 裁定）
+     * ——不帶 MMAP_PROT_XUANSI_PSRAM 的 EXEC 請求誠實拒絕（見下方）。
+     * 非 EXEC 照舊 8BIT 對齊配置。 */
     if (prot & MMAP_PROT_EXEC) {
         if (prot & MMAP_PROT_XUANSI_PSRAM) {
             return xuansi_mmap_exec(size);
         }
-#if XUANSI_AOT_IRAM_LANE
-        return xuansi_mmap_exec_region(size);
-#else
-        /* XUANSI (patch #16): the internal-SRAM lane is not compiled —
-         * a plain EXEC request has no placement left. Refuse honestly
-         * (the #11 discipline) instead of handing out memory that
-         * cannot execute; the surgery lane above is the only AOT
-         * placement this build offers. */
+        /* XUANSI (patch #17): the internal-SRAM lane is gone — a plain
+         * EXEC request has no placement left. Refuse honestly (the #11
+         * discipline) instead of handing out memory that cannot
+         * execute; the surgery lane above is the only AOT placement
+         * this build offers. */
         return NULL;
-#endif
     }
     if (prot & MMAP_PROT_XUANSI_PSRAM) {
         /* XUANSI (P3-T10): 手術版 literal 池＝純資料，PSRAM 一般資料堆
@@ -664,14 +378,6 @@ os_munmap(void *addr, size_t size)
     char *ptr = (char *)addr;
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-#if XUANSI_AOT_IRAM_LANE
-    /* XUANSI（P3-T6 第三分支——先行）：保留區內指針＝釋放單佔用槽。
-     * **絕不**落到通用 free()/esp_mmu_unmap——保留區是靜態儲存。
-     * 範圍查找（起訖界內非精確匹配）。 */
-    if (xuansi_munmap_exec_region(ptr)) {
-        return;
-    }
-#endif /* XUANSI_AOT_IRAM_LANE */
     /* XUANSI：PSRAM 執行映射走表收帳（esp_mmu_unmap＋釋放 PSRAM 背襯）。
      * os_mmap(EXEC) 返回 **dbus** 指針（修補 #3）——收帳查找須涵蓋
      * dbus 域（追收 #9，見 xuansi_munmap_exec 注記）。 */
@@ -732,13 +438,8 @@ void
 void *xuansi_exec_alias(void *dbus_ptr)
 {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-    /* XUANSI (P3-T6): reserved-region pointers are their own exec alias
-     * (internal SRAM is single-alias) - identity, not a table lookup. */
-#if XUANSI_AOT_IRAM_LANE
-    if (xuansi_ptr_in_aot_exec(dbus_ptr)) {
-        return dbus_ptr;
-    }
-#endif
+    /* XUANSI: 表查（本檔的 esp_mmu_map 映射位址≠dbus+常數——esp_mm 自選
+     * 執行視窗槽位）。表外位址＝非本機制記帳的指針，原樣返回。 */
     for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
         xuansi_exec_map_t *m = &s_xuansi_maps[i];
         if (m->exec == NULL) continue;
@@ -817,14 +518,7 @@ static void xuansi_sync_dbus_impl(void *dbus_base, size_t len)
 void xuansi_sync_exec(void *ptr, size_t len)
 {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-    /* 接受 dbus 或 exec 指針（載入器兩種都會傳）。
-     * P3-T6：保留區指針先行——單別名同步（見 xuansi_sync_exec_region）。 */
-#if XUANSI_AOT_IRAM_LANE
-    if (xuansi_ptr_in_aot_exec(ptr)) {
-        xuansi_sync_exec_region(ptr, len);
-        return;
-    }
-#endif
+    /* 接受 dbus 或 exec 指針（載入器兩種都會傳）。 */
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(ptr);
     if (m != NULL) {
         uint8_t *base = (uint8_t *)ptr;
@@ -857,17 +551,6 @@ os_icache_flush(void *start, size_t len)
      * 已完成）。**不得**改用 ROM Cache_Disable/Enable_ICache 全域輪舞
      * ——S3 實測殺 systimer（見 os_dcache_flush 注記）。 */
     if (start == NULL || len == 0) return;
-#if XUANSI_AOT_IRAM_LANE
-    /* XUANSI（P3-T6）：保留區＝單別名同步（內部 SRAM——M2C|INST 一發，
-     * 無雙匯流排鏡像）。 */
-    if (xuansi_ptr_in_aot_exec(start)) {
-        xuansi_sync_exec_region(start, len);
-        /* patch #13: aot_load_from_aot_file ends the load here (this is
-         * the last touch of the region); close the PMS write window. */
-        xuansi_pms_guard_exit();
-        return;
-    }
-#endif
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(start);
     uint8_t *base = (uint8_t *)start;
     uint32_t off;
@@ -898,14 +581,7 @@ os_get_dbus_mirror(void *ibus)
 {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     /* XUANSI: 表查（本檔的 esp_mmu_map 映射位址≠dbus+常數——esp_mm 自選
-     * 執行視窗槽位）。表外位址＝非本機制記帳的指針，原樣返回。
-     * P3-T6：保留區指針＝自身鏡像（內部 SRAM 單別名——顯式短路，不依賴
-     * in_ibus_ext 對內部位址的否定判定）。 */
-#if XUANSI_AOT_IRAM_LANE
-    if (xuansi_ptr_in_aot_exec(ibus)) {
-        return ibus;
-    }
-#endif
+     * 執行視窗槽位）。表外位址＝非本機制記帳的指針，原樣返回。 */
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(ibus);
     if (m != NULL) {
         return m->dbus + ((uint8_t *)ibus - (uint8_t *)m->exec);
