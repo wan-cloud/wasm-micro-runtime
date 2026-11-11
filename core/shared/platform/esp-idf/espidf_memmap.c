@@ -99,6 +99,31 @@ static xuansi_exec_map_t *xuansi_map_find_by_dbus(void *ptr)
     return NULL;
 }
 
+/* XUANSI VENDORED PATCH #16 (2026-11-11) — the internal-SRAM AOT lane
+ * (patches #12/#13) is compile-time optional, default OFF.
+ *
+ * The consumer's fw 0.4.0 retires the internal lane: every .aot rides
+ * the PSRAM exec window (the surgery path), so the static IRAM reserve
+ * (#12: 24 KB of .iram1 + single-occupancy slot + munmap third branch)
+ * and the PMS write-protection survival layers (#13: the write probe,
+ * xuansi_aot_exec_writable() and the per-boot unroute guard) are dead
+ * weight on that product. Gate them behind XUANSI_AOT_IRAM_LANE (CMake
+ * option in shared_platform.cmake, default OFF; ON restores the
+ * pre-#16 state bit-identically).
+ *
+ * OFF means: no reserve is placed, xuansi_aot_exec_budget() /
+ * xuansi_aot_exec_writable() are not exported, the #13 probe and the
+ * per-boot PMS unroute guard are not compiled, and os_mmap(EXEC)
+ * without MMAP_PROT_XUANSI_PSRAM refuses honestly (NULL) — there is no
+ * internal placement anymore. The SURGERY face is NOT gated and stays
+ * byte-for-byte: the patch #3 PSRAM exec window, the patch #15 pool
+ * registry / os_munmap fourth branch and the loader's aot_xuansi_kind()
+ * dispatch are the only lane fw 0.4.0 uses. */
+#ifndef XUANSI_AOT_IRAM_LANE
+#define XUANSI_AOT_IRAM_LANE 0
+#endif
+
+#if XUANSI_AOT_IRAM_LANE
 /* XUANSI (P3-T6, 2026-11-10): A1 internal-SRAM AOT text placement.
  *
  * Board measurement (P3-T5, canonical load states) proved the
@@ -351,6 +376,7 @@ xuansi_sync_exec_region(const void *ptr, size_t len)
                     ESP_CACHE_MSYNC_FLAG_DIR_M2C
                         | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
 }
+#endif /* XUANSI_AOT_IRAM_LANE (patch #16: the #12/#13 machinery above) */
 
 
 /* XUANSI (P3-T6): parked for A3 — os_mmap(EXEC) now serves the internal
@@ -515,7 +541,16 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
         if (prot & MMAP_PROT_XUANSI_PSRAM) {
             return xuansi_mmap_exec(size);
         }
+#if XUANSI_AOT_IRAM_LANE
         return xuansi_mmap_exec_region(size);
+#else
+        /* XUANSI (patch #16): the internal-SRAM lane is not compiled —
+         * a plain EXEC request has no placement left. Refuse honestly
+         * (the #11 discipline) instead of handing out memory that
+         * cannot execute; the surgery lane above is the only AOT
+         * placement this build offers. */
+        return NULL;
+#endif
     }
     if (prot & MMAP_PROT_XUANSI_PSRAM) {
         /* XUANSI (P3-T10): 手術版 literal 池＝純資料，PSRAM 一般資料堆
@@ -629,12 +664,14 @@ os_munmap(void *addr, size_t size)
     char *ptr = (char *)addr;
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
+#if XUANSI_AOT_IRAM_LANE
     /* XUANSI（P3-T6 第三分支——先行）：保留區內指針＝釋放單佔用槽。
      * **絕不**落到通用 free()/esp_mmu_unmap——保留區是靜態儲存。
      * 範圍查找（起訖界內非精確匹配）。 */
     if (xuansi_munmap_exec_region(ptr)) {
         return;
     }
+#endif /* XUANSI_AOT_IRAM_LANE */
     /* XUANSI：PSRAM 執行映射走表收帳（esp_mmu_unmap＋釋放 PSRAM 背襯）。
      * os_mmap(EXEC) 返回 **dbus** 指針（修補 #3）——收帳查找須涵蓋
      * dbus 域（追收 #9，見 xuansi_munmap_exec 注記）。 */
@@ -697,9 +734,11 @@ void *xuansi_exec_alias(void *dbus_ptr)
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     /* XUANSI (P3-T6): reserved-region pointers are their own exec alias
      * (internal SRAM is single-alias) - identity, not a table lookup. */
+#if XUANSI_AOT_IRAM_LANE
     if (xuansi_ptr_in_aot_exec(dbus_ptr)) {
         return dbus_ptr;
     }
+#endif
     for (int i = 0; i < XUANSI_MIRROR_MAX; i++) {
         xuansi_exec_map_t *m = &s_xuansi_maps[i];
         if (m->exec == NULL) continue;
@@ -780,10 +819,12 @@ void xuansi_sync_exec(void *ptr, size_t len)
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     /* 接受 dbus 或 exec 指針（載入器兩種都會傳）。
      * P3-T6：保留區指針先行——單別名同步（見 xuansi_sync_exec_region）。 */
+#if XUANSI_AOT_IRAM_LANE
     if (xuansi_ptr_in_aot_exec(ptr)) {
         xuansi_sync_exec_region(ptr, len);
         return;
     }
+#endif
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(ptr);
     if (m != NULL) {
         uint8_t *base = (uint8_t *)ptr;
@@ -816,6 +857,7 @@ os_icache_flush(void *start, size_t len)
      * 已完成）。**不得**改用 ROM Cache_Disable/Enable_ICache 全域輪舞
      * ——S3 實測殺 systimer（見 os_dcache_flush 注記）。 */
     if (start == NULL || len == 0) return;
+#if XUANSI_AOT_IRAM_LANE
     /* XUANSI（P3-T6）：保留區＝單別名同步（內部 SRAM——M2C|INST 一發，
      * 無雙匯流排鏡像）。 */
     if (xuansi_ptr_in_aot_exec(start)) {
@@ -825,6 +867,7 @@ os_icache_flush(void *start, size_t len)
         xuansi_pms_guard_exit();
         return;
     }
+#endif
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(start);
     uint8_t *base = (uint8_t *)start;
     uint32_t off;
@@ -858,9 +901,11 @@ os_get_dbus_mirror(void *ibus)
      * 執行視窗槽位）。表外位址＝非本機制記帳的指針，原樣返回。
      * P3-T6：保留區指針＝自身鏡像（內部 SRAM 單別名——顯式短路，不依賴
      * in_ibus_ext 對內部位址的否定判定）。 */
+#if XUANSI_AOT_IRAM_LANE
     if (xuansi_ptr_in_aot_exec(ibus)) {
         return ibus;
     }
+#endif
     xuansi_exec_map_t *m = xuansi_map_find_by_exec(ibus);
     if (m != NULL) {
         return m->dbus + ((uint8_t *)ibus - (uint8_t *)m->exec);

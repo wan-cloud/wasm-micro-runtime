@@ -24,3 +24,18 @@ set (PLATFORM_SHARED_SOURCE ${source_all} ${PLATFORM_COMMON_MATH_SOURCE})
 if(CONFIG_ESP32S3_SPIRAM_SUPPORT)
     add_definitions(-DWASM_MEM_DUAL_BUS_MIRROR=1)
 endif()
+
+# XUANSI VENDORED PATCH #16 (2026-11-11): compile-time switch for the
+# internal-SRAM AOT lane (patches #12/#13 — static IRAM reserve, PMS
+# write-probe, per-boot unroute guard), DEFAULT OFF. The consumer's fw
+# 0.4.0 retires the internal lane: every .aot rides the PSRAM exec
+# window (the surgery path: patch #3 mapping + #15 pool registry +
+# loader container-kind dispatch), which stays unconditional. Turn this
+# ON only to rebuild the pre-#16 internal lane bit-identically (rollback
+# leg). OFF also drops the xuansi_aot_exec_budget()/
+# xuansi_aot_exec_writable() exports — consumers must stop referencing
+# them first (see the patch #16 note in espidf_memmap.c).
+option(XUANSI_AOT_IRAM_LANE "Compile the internal-SRAM AOT lane (xuansi patches #12/#13)" OFF)
+if(XUANSI_AOT_IRAM_LANE)
+    add_definitions(-DXUANSI_AOT_IRAM_LANE=1)
+endif()
