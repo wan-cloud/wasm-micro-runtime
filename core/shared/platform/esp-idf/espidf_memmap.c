@@ -14,7 +14,17 @@
 #define in_ibus_ext(addr) \
     (((uint32)addr >= SOC_IROM_LOW) && ((uint32)addr < SOC_IROM_HIGH))
 
+/* XUANSI (patch #19): s_spinlock has exactly one user, the body of
+ * os_dcache_flush() below, which patch 3 guarded with
+ *   (WASM_MEM_DUAL_BUS_MIRROR != 0) && !defined(CONFIG_IDF_TARGET_ESP32S3)
+ * when it retired that body to a no-op on S3. The definition kept the
+ * wider upstream guard, so on S3 (WASM_MEM_DUAL_BUS_MIRROR=1) it was
+ * defined and never used (-Wunused-variable). The definition now carries
+ * the guard of its only use, so nothing changes on any target: wherever
+ * the body compiles, the definition is there with it. */
+#if !defined(CONFIG_IDF_TARGET_ESP32S3)
 static portMUX_TYPE s_spinlock = portMUX_INITIALIZER_UNLOCKED;
+#endif
 #endif
 
 /*
