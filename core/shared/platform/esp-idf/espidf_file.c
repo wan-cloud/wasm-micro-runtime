@@ -6,6 +6,12 @@
 #include "platform_api_extension.h"
 #include "libc_errno.h"
 #include <unistd.h>
+#include <sys/stat.h>    /* struct stat, S_IS*, fstat, fstatat, futimens, utimensat */
+
+#if defined(__PICOLIBC__)
+/* picolibc declares no renameat (newlib's <stdio.h> does); the ENOSYS stub in espidf_platform.c is the definition */
+int renameat(int, const char *, int, const char *);
+#endif
 
 #if !defined(__APPLE__) && !defined(ESP_PLATFORM)
 #define CONFIG_HAS_PWRITEV 1
